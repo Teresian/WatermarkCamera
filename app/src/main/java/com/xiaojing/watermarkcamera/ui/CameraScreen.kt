@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -13,24 +14,30 @@ import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.Undo
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -59,11 +66,11 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
         )
     }
     var showPanel by remember { mutableStateOf(false) }
+    var showStitchPanel by remember { mutableStateOf(false) }
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
     var flashOn by remember { mutableStateOf(false) }
     var capture by remember { mutableStateOf<ImageCapture?>(null) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
-    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -101,19 +108,23 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
         onDispose { cameraExecutor.shutdown() }
     }
 
-    // 绑定相机
-    LaunchedEffect(hasCamera, lensFacing, previewView) {
+    // 绑定相机：画幅切换时重新绑定，保证预览与成片比例一致
+    LaunchedEffect(hasCamera, lensFacing, previewView, state.ratio) {
         val pv = previewView ?: return@LaunchedEffect
         if (!hasCamera) return@LaunchedEffect
         val provider = context.getCameraProvider()
-        cameraProvider = provider
         provider.unbindAll()
 
-        val preview = Preview.Builder().build().also {
-            it.setSurfaceProvider(pv.surfaceProvider)
-        }
+        val targetRatio = if (state.ratio == CaptureRatio.RATIO_4_3) AspectRatio.RATIO_4_3 else AspectRatio.RATIO_16_9
+
+        val preview = Preview.Builder()
+            .setTargetAspectRatio(targetRatio)
+            .build().also {
+                it.setSurfaceProvider(pv.surfaceProvider)
+            }
         val imageCapture = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setTargetAspectRatio(targetRatio)
             .build()
         capture = imageCapture
 
@@ -131,26 +142,38 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (hasCamera) {
-            AndroidView(
-                factory = { ctx ->
-                    PreviewView(ctx).apply {
-                        scaleType = PreviewView.ScaleType.FILL_CENTER
-                        implementationMode = PreviewView.ImplementationMode.COMPATIBLE
-                        previewView = this
-                    }
-                },
-                modifier = Modifier.fillMaxSize()
-            )
+            // 取景框：4:3 时居中留边，全屏时铺满
+            Box(
+                modifier = if (state.ratio == CaptureRatio.RATIO_4_3) {
+                    Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.Center)
+                } else {
+                    Modifier.fillMaxSize()
+                }
+            ) {
+                AndroidView(
+                    factory = { ctx ->
+                        PreviewView(ctx).apply {
+                            scaleType = PreviewView.ScaleType.FILL_CENTER
+                            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+                            previewView = this
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
+                )
 
-            WatermarkOverlay(
-                showTime = state.showTime,
-                showDate = state.showDate,
-                showLocation = state.showLocation && state.location.isNotBlank(),
-                showNote = state.showNote && state.note.isNotBlank(),
-                location = state.location,
-                note = state.note,
-                modifier = Modifier.align(Alignment.BottomStart).padding(start = 18.dp, bottom = 150.dp)
-            )
+                // 参考线
+                GridOverlay(mode = state.grid, modifier = Modifier.fillMaxSize())
+
+                WatermarkOverlay(
+                    showTime = state.showTime,
+                    showDate = state.showDate,
+                    showLocation = state.showLocation && state.location.isNotBlank(),
+                    showNote = state.showNote && state.note.isNotBlank(),
+                    location = state.location,
+                    note = state.note,
+                    modifier = Modifier.align(Alignment.BottomStart).padding(start = 18.dp, bottom = 20.dp)
+                )
+            }
 
             // 顶部工具条
             Row(
@@ -159,12 +182,42 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                     .padding(top = 44.dp, start = 16.dp, end = 16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                RoundIconButton(onClick = { flashOn = !flashOn }) {
-                    Icon(
-                        imageVector = if (flashOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
-                        contentDescription = "闪光灯",
-                        tint = if (flashOn) ACCENT else Color.White
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    RoundIconButton(onClick = { flashOn = !flashOn }) {
+                        Icon(
+                            imageVector = if (flashOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
+                            contentDescription = "闪光灯",
+                            tint = if (flashOn) ACCENT else Color.White
+                        )
+                    }
+                    RoundIconButton(onClick = {
+                        vm.setGrid(
+                            when (state.grid) {
+                                GridMode.NONE -> GridMode.GRID
+                                GridMode.GRID -> GridMode.CROSS
+                                GridMode.CROSS -> GridMode.NONE
+                            }
+                        )
+                    }) {
+                        Icon(
+                            Icons.Filled.GridOn,
+                            "参考线",
+                            tint = if (state.grid != GridMode.NONE) ACCENT else Color.White
+                        )
+                    }
+                    RoundIconButton(onClick = {
+                        vm.setRatio(
+                            if (state.ratio == CaptureRatio.RATIO_4_3) CaptureRatio.RATIO_FULL
+                            else CaptureRatio.RATIO_4_3
+                        )
+                    }) {
+                        Text(
+                            if (state.ratio == CaptureRatio.RATIO_4_3) "4:3" else "全",
+                            color = ACCENT,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     RoundIconButton(onClick = { vm.refreshLocation() }) {
@@ -194,13 +247,45 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         onNoteChange = vm::setNote
                     )
                 }
-                Spacer(Modifier.height(20.dp))
+                AnimatedVisibility(visible = showStitchPanel, enter = fadeIn(), exit = fadeOut()) {
+                    StitchPanel(
+                        state = state,
+                        onColumns = vm::setStitchColumns,
+                        onStitch = { vm.stitchAndSave() },
+                        onUndo = { vm.undoPending() },
+                        onClear = { vm.clearPending() }
+                    )
+                }
+                Spacer(Modifier.height(16.dp))
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 40.dp),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Spacer(Modifier.size(48.dp))
+                    // 边拍边拼开关 + 张数
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(if (state.stitching) ACCENT else Color(0x66000000))
+                            .clickable { vm.toggleStitching() }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            if (state.stitching) "拼图中" else "边拍边拼",
+                            color = if (state.stitching) Color(0xFF0B1B2B) else Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        if (state.pendingCount > 0) {
+                            Text(
+                                "${state.pendingCount} 张",
+                                color = if (state.stitching) Color(0xFF0B1B2B) else ACCENT,
+                                fontSize = 10.sp
+                            )
+                        }
+                    }
+
                     ShutterButton(enabled = !state.shooting) {
                         val imageCapture = capture ?: return@ShutterButton
                         val file = java.io.File(context.cacheDir, "wm_capture_" + System.currentTimeMillis() + ".jpg")
@@ -219,19 +304,33 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                             }
                         )
                     }
-                    RoundIconButton(
-                        onClick = {
-                            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
-                                CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
-                        },
-                        size = 48.dp
+
+                    // 拼图面板入口
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0x66000000))
+                            .clickable { showStitchPanel = !showStitchPanel }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
                     ) {
-                        Icon(Icons.Filled.SwapHoriz, "切换摄像头", tint = Color.White)
+                        Icon(Icons.Filled.GridOn, "拼图", tint = if (state.pendingCount > 0) ACCENT else Color.White)
+                        Text("拼接", color = Color.White, fontSize = 10.sp)
                     }
+                }
+                Spacer(Modifier.height(12.dp))
+                RoundIconButton(
+                    onClick = {
+                        lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+                            CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+                    },
+                    size = 40.dp
+                ) {
+                    Icon(Icons.Filled.SwapHoriz, "切换摄像头", tint = Color.White, modifier = Modifier.size(20.dp))
                 }
             }
 
-            if (state.shooting) {
+            if (state.shooting || state.busy) {
                 Box(
                     Modifier.fillMaxSize().background(Color(0x66000000)),
                     contentAlignment = Alignment.Center
@@ -268,6 +367,27 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
             hostState = snackbarHostState,
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp)
         )
+    }
+}
+
+/** 取景参考线：九宫格或十字线 */
+@Composable
+private fun GridOverlay(mode: GridMode, modifier: Modifier = Modifier) {
+    if (mode == GridMode.NONE) return
+    Canvas(modifier = modifier) {
+        val line = Color(0x80FFFFFF)
+        val stroke = 1.dp.toPx()
+        val w = size.width
+        val h = size.height
+        if (mode == GridMode.GRID) {
+            for (i in 1..2) {
+                drawLine(line, Offset(w * i / 3f, 0f), Offset(w * i / 3f, h), stroke)
+                drawLine(line, Offset(0f, h * i / 3f), Offset(w, h * i / 3f), stroke)
+            }
+        } else {
+            drawLine(line, Offset(w / 2f, 0f), Offset(w / 2f, h), stroke)
+            drawLine(line, Offset(0f, h / 2f), Offset(w, h / 2f), stroke)
+        }
     }
 }
 
@@ -320,6 +440,73 @@ private fun WatermarkOverlay(
             if (showNote) {
                 Text(note, color = ACCENT, fontSize = 12.sp, maxLines = 1)
             }
+        }
+    }
+}
+
+/** 边拍边拼面板：列数选择 + 拼接/撤销/清空 */
+@Composable
+private fun StitchPanel(
+    state: WatermarkUiState,
+    onColumns: (Int) -> Unit,
+    onStitch: () -> Unit,
+    onUndo: () -> Unit,
+    onClear: () -> Unit
+) {
+    Column(
+        Modifier
+            .padding(horizontal = 16.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(Color(0xCC101F2E))
+            .padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("拼图列数", color = Color.White, fontSize = 14.sp)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (n in 1..4) {
+                    val selected = state.stitchColumns == n
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selected) ACCENT else Color(0x33FFFFFF))
+                            .clickable { onColumns(n) }
+                            .padding(horizontal = 12.dp, vertical = 5.dp)
+                    ) {
+                        Text(
+                            "${n}列",
+                            color = if (selected) Color(0xFF0B1B2B) else Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "已暂存 ${state.pendingCount} 张",
+            color = Color(0x99FFFFFF),
+            fontSize = 12.sp
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = onStitch,
+                enabled = state.pendingCount > 0 && !state.busy,
+                modifier = Modifier.weight(1f),
+                colors = ButtonDefaults.buttonColors(containerColor = ACCENT)
+            ) {
+                Text("拼接保存", color = Color(0xFF0B1B2B), fontWeight = FontWeight.Bold)
+            }
+            OutlinedButton(onClick = onUndo, enabled = state.pendingCount > 0) { Text("撤销") }
+            OutlinedButton(onClick = onClear, enabled = state.pendingCount > 0) { Text("清空") }
         }
     }
 }

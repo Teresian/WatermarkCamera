@@ -1,7 +1,6 @@
 package com.xiaojing.watermarkcamera.ui
 
 import android.app.Application
-import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
@@ -10,6 +9,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xiaojing.watermarkcamera.util.ImageSaver
 import com.xiaojing.watermarkcamera.util.LocationHelper
+import com.xiaojing.watermarkcamera.util.PhotoStitcher
 import com.xiaojing.watermarkcamera.watermark.WatermarkConfig
 import com.xiaojing.watermarkcamera.watermark.WatermarkRenderer
 import kotlinx.coroutines.Dispatchers
@@ -21,6 +21,19 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
+/** 拍摄画幅 */
+enum class CaptureRatio(val label: String) {
+    RATIO_4_3("4:3"),
+    RATIO_FULL("全屏")
+}
+
+/** 取景参考线 */
+enum class GridMode(val label: String) {
+    NONE("无"),
+    GRID("九宫格"),
+    CROSS("十字线")
+}
+
 data class WatermarkUiState(
     val showTime: Boolean = true,
     val showDate: Boolean = true,
@@ -30,13 +43,24 @@ data class WatermarkUiState(
     val location: String = "",
     val locationLoading: Boolean = false,
     val shooting: Boolean = false,
-    val toast: String? = null
+    val toast: String? = null,
+    // 画幅与参考线
+    val ratio: CaptureRatio = CaptureRatio.RATIO_4_3,
+    val grid: GridMode = GridMode.NONE,
+    // 边拍边拼
+    val stitching: Boolean = false,
+    val pendingCount: Int = 0,
+    val stitchColumns: Int = 2,
+    val busy: Boolean = false
 )
 
 class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _state = MutableStateFlow(WatermarkUiState())
     val state: StateFlow<WatermarkUiState> = _state.asStateFlow()
+
+    /** 边拍边拼暂存区：已烧好水印、等待拼接的图片 */
+    private val pending = ArrayList<Bitmap>()
 
     fun toggleTime() = _state.update { it.copy(showTime = !it.showTime) }
 
@@ -49,6 +73,14 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun setNote(text: String) = _state.update { it.copy(note = text) }
 
     fun consumeToast() = _state.update { it.copy(toast = null) }
+
+    fun setRatio(ratio: CaptureRatio) = _state.update { it.copy(ratio = ratio) }
+
+    fun setGrid(grid: GridMode) = _state.update { it.copy(grid = grid) }
+
+    fun toggleStitching() = _state.update { it.copy(stitching = !it.stitching) }
+
+    fun setStitchColumns(n: Int) = _state.update { it.copy(stitchColumns = n.coerceIn(1, 4)) }
 
     fun refreshLocation() {
         if (_state.value.locationLoading) return
@@ -70,7 +102,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(shooting = true) }
         val snapshot = _state.value
         viewModelScope.launch {
-            val path = withContext(Dispatchers.IO) {
+            val result = withContext(Dispatchers.IO) {
                 var bitmap: Bitmap? = null
                 try {
                     bitmap = decode(file)
@@ -84,23 +116,92 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                         timestamp = System.currentTimeMillis()
                     )
                     val stamped = WatermarkRenderer.render(bitmap, config)
-                    val saved = ImageSaver.save(getApplication(), stamped)
-                    if (stamped !== bitmap) stamped.recycle()
-                    saved
+                    if (stamped !== bitmap) bitmap.recycle()
+                    if (snapshot.stitching) {
+                        // 边拍边拼：先进暂存区，不落相册
+                        pending.add(stamped)
+                        null
+                    } else {
+                        val saved = ImageSaver.save(getApplication(), stamped)
+                        if (saved == null) stamped.recycle()
+                        saved
+                    }
                 } catch (e: Exception) {
                     null
                 } finally {
-                    bitmap?.recycle()
                     file.delete()
                 }
             }
             _state.update {
                 it.copy(
                     shooting = false,
-                    toast = if (path == null) "保存失败，请检查存储权限" else "已保存到相册/WatermarkCamera"
+                    pendingCount = pending.size,
+                    toast = when {
+                        it.stitching -> "已暂存第 " + pending.size + " 张，点「拼接保存」合成"
+                        result == null -> "保存失败，请检查存储权限"
+                        else -> "已保存到相册/WatermarkCamera"
+                    }
                 )
             }
         }
+    }
+
+    /** 把暂存区里的照片按列数拼成一张并保存 */
+    fun stitchAndSave() {
+        if (pending.isEmpty()) {
+            _state.update { it.copy(toast = "暂存区是空的，先拍几张") }
+            return
+        }
+        if (_state.value.busy) return
+        val columns = _state.value.stitchColumns
+        val sources = ArrayList(pending)
+        _state.update { it.copy(busy = true) }
+        viewModelScope.launch {
+            val path = withContext(Dispatchers.IO) {
+                var merged: Bitmap? = null
+                try {
+                    merged = PhotoStitcher.stitch(sources, columns)
+                    val saved = merged?.let { ImageSaver.save(getApplication(), it) }
+                    saved
+                } catch (e: Exception) {
+                    null
+                } finally {
+                    merged?.recycle()
+                }
+            }
+            if (path != null) {
+                sources.forEach { it.recycle() }
+                pending.clear()
+            }
+            _state.update {
+                it.copy(
+                    busy = false,
+                    pendingCount = pending.size,
+                    toast = if (path == null) "拼接失败，请重试" else "已拼成 " + PhotoStitcher.columnLabel(columns) + "长图并保存"
+                )
+            }
+        }
+    }
+
+    /** 清空暂存区 */
+    fun clearPending() {
+        pending.forEach { if (!it.isRecycled) it.recycle() }
+        pending.clear()
+        _state.update { it.copy(pendingCount = 0, toast = "已清空暂存区") }
+    }
+
+    /** 撤销最后一张暂存 */
+    fun undoPending() {
+        if (pending.isEmpty()) return
+        val last = pending.removeAt(pending.size - 1)
+        if (!last.isRecycled) last.recycle()
+        _state.update { it.copy(pendingCount = pending.size, toast = "已撤销最后一张") }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        pending.forEach { if (!it.isRecycled) it.recycle() }
+        pending.clear()
     }
 
     private fun decode(file: File): Bitmap {
