@@ -4,14 +4,17 @@ package com.xiaojing.watermarkcamera.watermark
 data class WatermarkConfig(
     val showTime: Boolean = true,
     val showDate: Boolean = true,
+    val showWeather: Boolean = true,
     val showLocation: Boolean = true,
     val showNote: Boolean = false,
     val note: String = "",
     val location: String = "",
+    val weather: String = "",
     val timestamp: Long = System.currentTimeMillis()
 ) {
     fun isEmpty(): Boolean {
         if (showTime || showDate) return false
+        if (showWeather && weather.isNotBlank()) return false
         if (showLocation && location.isNotBlank()) return false
         if (showNote && note.isNotBlank()) return false
         return true

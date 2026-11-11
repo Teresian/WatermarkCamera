@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.xiaojing.watermarkcamera.util.ImageSaver
 import com.xiaojing.watermarkcamera.util.LocationHelper
 import com.xiaojing.watermarkcamera.util.PhotoStitcher
+import com.xiaojing.watermarkcamera.util.WeatherHelper
 import com.xiaojing.watermarkcamera.watermark.WatermarkConfig
 import com.xiaojing.watermarkcamera.watermark.WatermarkRenderer
 import kotlinx.coroutines.Dispatchers
@@ -34,13 +35,18 @@ enum class GridMode(val label: String) {
     CROSS("十字线")
 }
 
+/** 备注快捷选项（对应参考 App 的「选择备注」） */
+val NOTE_PRESETS = listOf("总表", "电采暖A项", "电采暖B项", "电采暖C项")
+
 data class WatermarkUiState(
     val showTime: Boolean = true,
     val showDate: Boolean = true,
+    val showWeather: Boolean = true,
     val showLocation: Boolean = true,
     val showNote: Boolean = false,
     val note: String = "",
     val location: String = "",
+    val weather: String = "",
     val locationLoading: Boolean = false,
     val shooting: Boolean = false,
     val toast: String? = null,
@@ -66,11 +72,20 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleDate() = _state.update { it.copy(showDate = !it.showDate) }
 
+    fun toggleWeather() = _state.update { it.copy(showWeather = !it.showWeather) }
+
     fun toggleLocation() = _state.update { it.copy(showLocation = !it.showLocation) }
 
     fun toggleNote() = _state.update { it.copy(showNote = !it.showNote) }
 
-    fun setNote(text: String) = _state.update { it.copy(note = text) }
+    fun setNote(text: String) = _state.update {
+        it.copy(note = text, showNote = text.isNotBlank())
+    }
+
+    /** 选预设备注；传空串表示「无」 */
+    fun pickNote(text: String) = _state.update {
+        it.copy(note = text, showNote = text.isNotBlank())
+    }
 
     fun consumeToast() = _state.update { it.copy(toast = null) }
 
@@ -82,14 +97,17 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setStitchColumns(n: Int) = _state.update { it.copy(stitchColumns = n.coerceIn(1, 4)) }
 
+    /** 刷新定位 + 天气（天气依赖坐标） */
     fun refreshLocation() {
         if (_state.value.locationLoading) return
         _state.update { it.copy(locationLoading = true) }
         viewModelScope.launch {
             val place = LocationHelper.currentPlace(getApplication())
+            val weather = place?.let { WeatherHelper.current(it.lat, it.lon) }.orEmpty()
             _state.update {
                 it.copy(
-                    location = place.orEmpty(),
+                    location = place?.name.orEmpty(),
+                    weather = weather,
                     locationLoading = false,
                     toast = if (place == null) "定位失败，请检查定位权限与开关" else it.toast
                 )
@@ -109,10 +127,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     val config = WatermarkConfig(
                         showTime = snapshot.showTime,
                         showDate = snapshot.showDate,
+                        showWeather = snapshot.showWeather,
                         showLocation = snapshot.showLocation,
                         showNote = snapshot.showNote,
                         note = snapshot.note,
                         location = snapshot.location,
+                        weather = snapshot.weather,
                         timestamp = System.currentTimeMillis()
                     )
                     val stamped = WatermarkRenderer.render(bitmap, config)

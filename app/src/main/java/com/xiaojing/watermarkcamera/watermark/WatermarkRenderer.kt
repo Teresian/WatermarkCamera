@@ -11,7 +11,16 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-/** 把水印烧录到图片左下角 */
+/**
+ * 把水印烧录到图片左下角，版式与「今日水印相机」的基础样式一致：
+ *
+ *   06:36 │ 2026-11-10
+ *         │ 星期二  轻度雾霾 -2°C
+ *   吉林省长春市南关区自强街道 · 亚泰富苑购物中心
+ *   备注：总表
+ *
+ * 时间在黄色竖线左侧，高度 = 右侧两行小字的高度；地点与备注整行左对齐。
+ */
 object WatermarkRenderer {
 
     private const val ACCENT = 0xFFFFD54F.toInt()
@@ -36,44 +45,77 @@ object WatermarkRenderer {
 
         val margin = w * 0.045f
         val accentWidth = w * 0.009f
-        val textLeft = margin + accentWidth + w * 0.022f
-        val maxTextWidth = w - textLeft - margin
+        val gap = w * 0.02f
 
-        val timeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
-        val dateFmt = SimpleDateFormat("yyyy.MM.dd  EEEE", Locale.CHINA)
         val date = Date(config.timestamp)
+        val timeText = SimpleDateFormat("HH:mm", Locale.getDefault()).format(date)
+        val dateText = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(date)
+        val weekText = SimpleDateFormat("EEEE", Locale.CHINA).format(date)
 
-        val lines = ArrayList<Line>()
-        if (config.showTime) {
-            lines.add(Line(timeFmt.format(date), w * 0.085f, Color.WHITE, true, 0f))
+        // 黄线右侧：日期、星期+天气
+        val right = ArrayList<Line>()
+        if (config.showDate) right.add(Line(dateText, w * 0.036f, 0xE6FFFFFF.toInt(), false, 0f))
+        val weather = if (config.showWeather) config.weather.trim() else ""
+        val weekLine = if (config.showDate) {
+            if (weather.isNotEmpty()) "$weekText  $weather" else weekText
+        } else weather
+        if (weekLine.isNotBlank()) {
+            right.add(Line(weekLine, w * 0.033f, 0xE6FFFFFF.toInt(), false, w * 0.010f))
         }
-        if (config.showDate) {
-            lines.add(Line(dateFmt.format(date), w * 0.036f, 0xE6FFFFFF.toInt(), false, w * 0.012f))
-        }
+
+        // 整行：地点、备注
+        val fullRows = ArrayList<Line>()
         if (config.showLocation && config.location.isNotBlank()) {
-            lines.add(Line(config.location, w * 0.033f, 0xE6FFFFFF.toInt(), false, w * 0.014f))
+            fullRows.add(Line(config.location, w * 0.033f, 0xE6FFFFFF.toInt(), false, w * 0.014f))
         }
         if (config.showNote && config.note.isNotBlank()) {
-            lines.add(Line(config.note, w * 0.033f, ACCENT, false, w * 0.014f))
+            fullRows.add(Line("备注： " + config.note, w * 0.033f, ACCENT, false, w * 0.012f))
         }
-        if (lines.isEmpty()) return out
+
+        if (!config.showTime && right.isEmpty() && fullRows.isEmpty()) return out
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         paint.setShadowLayer(w * 0.006f, 0f, w * 0.002f, 0xAA000000.toInt())
 
-        // 先测量总高度
-        var blockHeight = 0f
-        val heights = ArrayList<Float>()
-        for (line in lines) {
-            paint.textSize = line.size
-            paint.typeface = if (line.bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+        fun lineHeight(size: Float): Float {
+            paint.textSize = size
+            paint.typeface = Typeface.DEFAULT
             val fm = paint.fontMetrics
-            val lh = fm.descent - fm.ascent
-            heights.add(lh)
-            blockHeight += lh + line.topGap
+            return fm.descent - fm.ascent
         }
 
+        var rightHeight = 0f
+        for (line in right) rightHeight += lineHeight(line.size) + line.topGap
+        var fullHeight = 0f
+        for (line in fullRows) fullHeight += lineHeight(line.size) + line.topGap
+
+        // 时间字号：高度固定为「两行小字」的高度
+        val unitLine = if (right.isNotEmpty()) lineHeight(right[0].size) else w * 0.036f * 1.4f
+        val timeSize = if (config.showTime) {
+            paint.textSize = 100f
+            paint.typeface = Typeface.DEFAULT_BOLD
+            val probe = paint.fontMetrics
+            val perUnit = (probe.descent - probe.ascent) / 100f
+            ((unitLine * 2f) / perUnit).coerceIn(w * 0.042f, w * 0.095f)
+        } else 0f
+
+        val timePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        timePaint.setShadowLayer(w * 0.006f, 0f, w * 0.002f, 0xAA000000.toInt())
+        timePaint.textSize = timeSize
+        timePaint.typeface = Typeface.DEFAULT_BOLD
+        timePaint.color = Color.WHITE
+        val timeMetrics = timePaint.fontMetrics
+        val timeHeight = timeMetrics.descent - timeMetrics.ascent
+        val timeWidth = if (config.showTime) timePaint.measureText(timeText) else 0f
+
+        val barLeft = margin + timeWidth + if (config.showTime) gap else 0f
+        val barRight = barLeft + accentWidth
+        val textLeft = barRight + gap
+        val maxRightWidth = (w - textLeft - margin).coerceAtLeast(w * 0.1f)
+        val maxFullWidth = (w - margin * 2f).coerceAtLeast(w * 0.1f)
+
         val bottom = h - margin
+        val blockHeight = maxOf(rightHeight, if (config.showTime) timeHeight else 0f) + fullHeight
         val top = bottom - blockHeight
 
         // 底部渐变遮罩，保证白字可读
@@ -87,26 +129,46 @@ object WatermarkRenderer {
         )
         canvas.drawRect(0f, shadeTop, w, h, shade)
 
-        // 左侧强调竖线
-        val barPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        barPaint.color = ACCENT
-        val barTop = top + blockHeight * 0.10f
-        canvas.drawRoundRect(
-            margin, barTop, margin + accentWidth, bottom - blockHeight * 0.06f,
-            accentWidth / 2f, accentWidth / 2f, barPaint
-        )
+        val headBottom = bottom - fullHeight
+        val headTop = headBottom - maxOf(rightHeight, if (config.showTime) timeHeight else 0f)
 
-        var y = top
-        for (i in lines.indices) {
-            val line = lines[i]
+        // 黄色竖线：与右侧两行文字同高
+        if (rightHeight > 0f) {
+            val barPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+            barPaint.color = ACCENT
+            canvas.drawRoundRect(
+                barLeft, headBottom - rightHeight, barRight, headBottom,
+                accentWidth / 2f, accentWidth / 2f, barPaint
+            )
+        }
+
+        // 时间：底对齐，贴在黄线左侧
+        if (config.showTime) {
+            canvas.drawText(timeText, margin, headBottom - timeMetrics.descent, timePaint)
+        }
+
+        // 黄线右侧两行
+        var y = headBottom - rightHeight
+        for (line in right) {
             y += line.topGap
             paint.textSize = line.size
             paint.color = line.color
             paint.typeface = if (line.bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
             val fm = paint.fontMetrics
-            val baseline = y - fm.ascent
-            canvas.drawText(ellipsize(line.text, paint, maxTextWidth), textLeft, baseline, paint)
-            y += heights[i]
+            canvas.drawText(ellipsize(line.text, paint, maxRightWidth), textLeft, y - fm.ascent, paint)
+            y += lineHeight(line.size)
+        }
+
+        // 地点、备注整行
+        y = headBottom
+        for (line in fullRows) {
+            y += line.topGap
+            paint.textSize = line.size
+            paint.color = line.color
+            paint.typeface = if (line.bold) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+            val fm = paint.fontMetrics
+            canvas.drawText(ellipsize(line.text, paint, maxFullWidth), margin, y - fm.ascent, paint)
+            y += lineHeight(line.size)
         }
         return out
     }

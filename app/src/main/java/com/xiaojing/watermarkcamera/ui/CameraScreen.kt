@@ -167,11 +167,16 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                 WatermarkOverlay(
                     showTime = state.showTime,
                     showDate = state.showDate,
+                    showWeather = state.showWeather,
                     showLocation = state.showLocation && state.location.isNotBlank(),
                     showNote = state.showNote && state.note.isNotBlank(),
                     location = state.location,
+                    weather = state.weather,
                     note = state.note,
-                    modifier = Modifier.align(Alignment.BottomStart).padding(start = 18.dp, bottom = 20.dp)
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .fillMaxWidth()
+                        .padding(start = 18.dp, end = 18.dp, bottom = 20.dp)
                 )
             }
 
@@ -242,9 +247,11 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         state = state,
                         onToggleTime = vm::toggleTime,
                         onToggleDate = vm::toggleDate,
+                        onToggleWeather = vm::toggleWeather,
                         onToggleLocation = vm::toggleLocation,
                         onToggleNote = vm::toggleNote,
-                        onNoteChange = vm::setNote
+                        onNoteChange = vm::setNote,
+                        onPickNote = vm::pickNote
                     )
                 }
                 AnimatedVisibility(visible = showStitchPanel, enter = fadeIn(), exit = fadeOut()) {
@@ -395,13 +402,15 @@ private fun GridOverlay(mode: GridMode, modifier: Modifier = Modifier) {
 private fun WatermarkOverlay(
     showTime: Boolean,
     showDate: Boolean,
+    showWeather: Boolean,
     showLocation: Boolean,
     showNote: Boolean,
     location: String,
+    weather: String,
     note: String,
     modifier: Modifier = Modifier
 ) {
-    if (!showTime && !showDate && !showLocation && !showNote) return
+    if (!showTime && !showDate && !showLocation && !showNote && !(showWeather && weather.isNotBlank())) return
     var now by remember { mutableStateOf(Date()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -409,37 +418,58 @@ private fun WatermarkOverlay(
             kotlinx.coroutines.delay(1000)
         }
     }
-    Row(modifier = modifier, verticalAlignment = Alignment.Bottom) {
-        Box(
-            Modifier
-                .width(4.dp)
-                .height(if (showTime) 56.dp else 34.dp)
-                .clip(RoundedCornerShape(2.dp))
-                .background(ACCENT)
-        )
-        Spacer(Modifier.width(10.dp))
-        Column {
+    val dateText = SimpleDateFormat("yyyy-MM-dd", Locale.CHINA).format(now)
+    val weekText = SimpleDateFormat("EEEE", Locale.CHINA).format(now)
+    val weatherText = if (showWeather) weather.trim() else ""
+    val weekLine = when {
+        showDate && weatherText.isNotEmpty() -> "$weekText  $weatherText"
+        showDate -> weekText
+        else -> weatherText
+    }
+
+    Column(modifier = modifier) {
+        // 头行：时间在黄线左侧，高度与右侧两行小字对齐
+        Row(
+            modifier = Modifier.height(IntrinsicSize.Min),
+            verticalAlignment = Alignment.Bottom
+        ) {
             if (showTime) {
                 Text(
                     SimpleDateFormat("HH:mm", Locale.getDefault()).format(now),
                     color = Color.White,
                     fontSize = 34.sp,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.align(Alignment.Bottom)
                 )
+                Spacer(Modifier.width(8.dp))
             }
-            if (showDate) {
-                Text(
-                    SimpleDateFormat("yyyy.MM.dd  EEEE", Locale.CHINA).format(now),
-                    color = Color(0xE6FFFFFF),
-                    fontSize = 13.sp
+            if (showDate || weekLine.isNotBlank()) {
+                Box(
+                    Modifier
+                        .width(3.dp)
+                        .fillMaxHeight()
+                        .clip(RoundedCornerShape(2.dp))
+                        .background(ACCENT)
                 )
+                Spacer(Modifier.width(8.dp))
+                Column {
+                    if (showDate) {
+                        Text(dateText, color = Color(0xE6FFFFFF), fontSize = 13.sp)
+                    }
+                    if (weekLine.isNotBlank()) {
+                        Text(weekLine, color = Color(0xE6FFFFFF), fontSize = 12.sp)
+                    }
+                }
             }
-            if (showLocation) {
-                Text(location, color = Color(0xE6FFFFFF), fontSize = 12.sp, maxLines = 1)
-            }
-            if (showNote) {
-                Text(note, color = ACCENT, fontSize = 12.sp, maxLines = 1)
-            }
+        }
+        // 地点、备注整行左对齐
+        if (showLocation && location.isNotBlank()) {
+            Spacer(Modifier.height(3.dp))
+            Text(location, color = Color(0xE6FFFFFF), fontSize = 12.sp, maxLines = 2)
+        }
+        if (showNote && note.isNotBlank()) {
+            Spacer(Modifier.height(3.dp))
+            Text("备注： " + note, color = ACCENT, fontSize = 12.sp, maxLines = 1)
         }
     }
 }
@@ -516,9 +546,11 @@ private fun WatermarkPanel(
     state: WatermarkUiState,
     onToggleTime: () -> Unit,
     onToggleDate: () -> Unit,
+    onToggleWeather: () -> Unit,
     onToggleLocation: () -> Unit,
     onToggleNote: () -> Unit,
-    onNoteChange: (String) -> Unit
+    onNoteChange: (String) -> Unit,
+    onPickNote: (String) -> Unit
 ) {
     Column(
         Modifier
@@ -529,15 +561,40 @@ private fun WatermarkPanel(
     ) {
         ToggleRow("时间", state.showTime, onToggleTime)
         ToggleRow("日期", state.showDate, onToggleDate)
+        ToggleRow("天气", state.showWeather, onToggleWeather)
         ToggleRow("地点", state.showLocation, onToggleLocation)
         ToggleRow("备注", state.showNote, onToggleNote)
+
+        // 备注快捷选项：总表 / 电采暖A项 / 电采暖B项 / 电采暖C项
         if (state.showNote) {
+            Row(
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                for (preset in NOTE_PRESETS) {
+                    val selected = state.note == preset
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selected) ACCENT else Color(0x33FFFFFF))
+                            .clickable { onPickNote(if (selected) "" else preset) }
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    ) {
+                        Text(
+                            preset,
+                            color = if (selected) Color(0xFF0B1B2B) else Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
             OutlinedTextField(
                 value = state.note,
                 onValueChange = onNoteChange,
-                placeholder = { Text("输入备注文字", color = Color(0x80FFFFFF)) },
+                placeholder = { Text("以上都没有，自行填写", color = Color(0x80FFFFFF)) },
                 singleLine = true,
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
             )
         }
     }

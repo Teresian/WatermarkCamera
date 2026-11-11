@@ -12,8 +12,8 @@ android {
         applicationId = "com.xiaojing.watermarkcamera"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "0.0.2-RC1"
+        versionCode = 3
+        versionName = "0.0.2-RC2"
         vectorDrawables { useSupportLibrary = true }
     }
 
