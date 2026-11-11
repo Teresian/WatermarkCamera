@@ -1,6 +1,7 @@
 package com.xiaojing.watermarkcamera.ui
 
 import android.app.Application
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
@@ -68,12 +69,30 @@ data class WatermarkUiState(
     val stitchColumns: Int = 2,
     val busy: Boolean = false,
     // 自定义备注
-    val notePresets: List<String> = DEFAULT_NOTE_PRESETS
+    val notePresets: List<String> = DEFAULT_NOTE_PRESETS,
+    // 闪光灯（持久化，重开应用保留）
+    val flashMode: FlashMode = FlashMode.OFF,
+    // 变焦倍数
+    val zoomRatio: Float = 1f,
+    val maxZoom: Float = 8f,
+    // 拼图设置面板
+    val showStitchPanel: Boolean = false
 )
 
 class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val _state = MutableStateFlow(WatermarkUiState())
+    /** 轻量本地配置：闪光灯、参考线等开关关掉应用也要保留 */
+    private val prefs = app.getSharedPreferences("wm_camera_prefs", Context.MODE_PRIVATE)
+
+    private val _state = MutableStateFlow(
+        WatermarkUiState(
+            flashMode = runCatching { FlashMode.valueOf(prefs.getString(KEY_FLASH, FlashMode.OFF.name)!!) }
+                .getOrDefault(FlashMode.OFF),
+            grid = runCatching { GridMode.valueOf(prefs.getString(KEY_GRID, GridMode.NONE.name)!!) }
+                .getOrDefault(GridMode.NONE),
+            stitchColumns = prefs.getInt(KEY_COLUMNS, 2).coerceIn(1, 4)
+        )
+    )
     val state: StateFlow<WatermarkUiState> = _state.asStateFlow()
 
     /** 边拍边拼暂存区：已烧好水印、等待拼接的图片 */
@@ -122,7 +141,49 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setRatio(ratio: CaptureRatio) = _state.update { it.copy(ratio = ratio) }
 
-    fun setGrid(grid: GridMode) = _state.update { it.copy(grid = grid) }
+    /** 参考线：改完立刻落盘，下次打开还是这个设定 */
+    fun setGrid(grid: GridMode) {
+        prefs.edit().putString(KEY_GRID, grid.name).apply()
+        _state.update { it.copy(grid = grid) }
+    }
+
+    /** 闪光灯：关 / 闪光 / 常亮，同样持久化 */
+    fun setFlashMode(mode: FlashMode) {
+        prefs.edit().putString(KEY_FLASH, mode.name).apply()
+        _state.update { it.copy(flashMode = mode) }
+    }
+
+    /** 点一下循环切换闪光灯，返回切换后的模式（无闪光灯时返回 null） */
+    fun cycleFlashMode(hasFlashUnit: Boolean): FlashMode? {
+        if (!hasFlashUnit) {
+            setToast("当前摄像头没有闪光灯")
+            return null
+        }
+        val next = when (_state.value.flashMode) {
+            FlashMode.OFF -> FlashMode.ON
+            FlashMode.ON -> FlashMode.TORCH
+            FlashMode.TORCH -> FlashMode.OFF
+        }
+        setFlashMode(next)
+        return next
+    }
+
+    /** 变焦：手势或按钮都走这里，范围 1x~maxZoom */
+    fun setZoom(ratio: Float) = _state.update {
+        it.copy(zoomRatio = ratio.coerceIn(1f, it.maxZoom))
+    }
+
+    /** 双指缩放：在当前倍数上乘一个系数 */
+    fun zoomBy(factor: Float) = _state.update {
+        it.copy(zoomRatio = (it.zoomRatio * factor).coerceIn(1f, it.maxZoom))
+    }
+
+    /** 相机支持的最大变焦倍数（绑定相机后回填） */
+    fun setMaxZoom(max: Float) = _state.update {
+        it.copy(maxZoom = if (max > 1f) max else 8f, zoomRatio = it.zoomRatio.coerceAtMost(if (max > 1f) max else 8f))
+    }
+
+    fun setShowStitchPanel(show: Boolean) = _state.update { it.copy(showStitchPanel = show) }
 
     fun setPlaceLevel(level: PlaceLevel) {
         _state.update { it.copy(placeLevel = level) }
@@ -131,7 +192,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleStitching() = _state.update { it.copy(stitching = !it.stitching) }
 
-    fun setStitchColumns(n: Int) = _state.update { it.copy(stitchColumns = n.coerceIn(1, 4)) }
+    fun setStitchColumns(n: Int) {
+        val v = n.coerceIn(1, 4)
+        prefs.edit().putInt(KEY_COLUMNS, v).apply()
+        _state.update { it.copy(stitchColumns = v) }
+    }
 
     /** 刷新定位 + 天气（天气依赖坐标） */
     fun refreshLocation() {
@@ -260,6 +325,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         super.onCleared()
         pending.forEach { if (!it.isRecycled) it.recycle() }
         pending.clear()
+    }
+
+    private companion object {
+        const val KEY_FLASH = "flash_mode"
+        const val KEY_GRID = "grid_mode"
+        const val KEY_COLUMNS = "stitch_columns"
     }
 
     private fun decode(file: File): Bitmap {

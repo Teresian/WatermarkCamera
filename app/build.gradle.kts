@@ -14,8 +14,8 @@ android {
         targetSdk = 34
         // 版本规则：默认只递增最后一位（0.0.x）；主次版本号需人工确认才动。
         // RC 标签按顺序往后加：RC1、RC2、RC3……
-        versionCode = 4
-        versionName = "0.0.2-RC3"
+        versionCode = 5
+        versionName = "0.0.2-RC4"
         vectorDrawables { useSupportLibrary = true }
     }
 
