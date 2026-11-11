@@ -43,9 +43,10 @@ object WatermarkRenderer {
         val canvas = Canvas(out)
         canvas.drawBitmap(source, 0f, 0f, null)
 
-        val margin = w * 0.045f
-        val accentWidth = w * 0.009f
-        val gap = w * 0.02f
+        // 水印整体放大：所有尺寸按同一比例放大，保持版式比例不变
+        val margin = w * 0.050f
+        val accentWidth = w * 0.011f
+        val gap = w * 0.022f
 
         val date = Date(config.timestamp)
         val timeText = SimpleDateFormat("HH:mm", Locale.getDefault()).format(date)
@@ -54,28 +55,28 @@ object WatermarkRenderer {
 
         // 黄线右侧：日期、星期+天气
         val right = ArrayList<Line>()
-        if (config.showDate) right.add(Line(dateText, w * 0.036f, 0xE6FFFFFF.toInt(), false, 0f))
+        if (config.showDate) right.add(Line(dateText, w * 0.043f, 0xE6FFFFFF.toInt(), false, 0f))
         val weather = if (config.showWeather) config.weather.trim() else ""
         val weekLine = if (config.showDate) {
             if (weather.isNotEmpty()) "$weekText  $weather" else weekText
         } else weather
         if (weekLine.isNotBlank()) {
-            right.add(Line(weekLine, w * 0.033f, 0xE6FFFFFF.toInt(), false, w * 0.010f))
+            right.add(Line(weekLine, w * 0.040f, 0xE6FFFFFF.toInt(), false, w * 0.012f))
         }
 
         // 整行：地点、备注
         val fullRows = ArrayList<Line>()
         if (config.showLocation && config.location.isNotBlank()) {
-            fullRows.add(Line(config.location, w * 0.033f, 0xE6FFFFFF.toInt(), false, w * 0.014f))
+            fullRows.add(Line(config.location, w * 0.040f, 0xE6FFFFFF.toInt(), false, w * 0.016f))
         }
         if (config.showNote && config.note.isNotBlank()) {
-            fullRows.add(Line("备注： " + config.note, w * 0.033f, ACCENT, false, w * 0.012f))
+            fullRows.add(Line("备注： " + config.note, w * 0.040f, ACCENT, false, w * 0.014f))
         }
 
         if (!config.showTime && right.isEmpty() && fullRows.isEmpty()) return out
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-        paint.setShadowLayer(w * 0.006f, 0f, w * 0.002f, 0xAA000000.toInt())
+        paint.setShadowLayer(w * 0.007f, 0f, w * 0.002f, 0xAA000000.toInt())
 
         fun lineHeight(size: Float): Float {
             paint.textSize = size
@@ -90,17 +91,17 @@ object WatermarkRenderer {
         for (line in fullRows) fullHeight += lineHeight(line.size) + line.topGap
 
         // 时间字号：高度固定为「两行小字」的高度
-        val unitLine = if (right.isNotEmpty()) lineHeight(right[0].size) else w * 0.036f * 1.4f
+        val unitLine = if (right.isNotEmpty()) lineHeight(right[0].size) else w * 0.043f * 1.4f
         val timeSize = if (config.showTime) {
             paint.textSize = 100f
             paint.typeface = Typeface.DEFAULT_BOLD
             val probe = paint.fontMetrics
             val perUnit = (probe.descent - probe.ascent) / 100f
-            ((unitLine * 2f) / perUnit).coerceIn(w * 0.042f, w * 0.095f)
+            ((unitLine * 2f) / perUnit).coerceIn(w * 0.050f, w * 0.112f)
         } else 0f
 
         val timePaint = Paint(Paint.ANTI_ALIAS_FLAG)
-        timePaint.setShadowLayer(w * 0.006f, 0f, w * 0.002f, 0xAA000000.toInt())
+        timePaint.setShadowLayer(w * 0.007f, 0f, w * 0.002f, 0xAA000000.toInt())
         timePaint.textSize = timeSize
         timePaint.typeface = Typeface.DEFAULT_BOLD
         timePaint.color = Color.WHITE

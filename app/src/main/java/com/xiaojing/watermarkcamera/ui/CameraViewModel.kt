@@ -10,6 +10,7 @@ import androidx.lifecycle.viewModelScope
 import com.xiaojing.watermarkcamera.util.ImageSaver
 import com.xiaojing.watermarkcamera.util.LocationHelper
 import com.xiaojing.watermarkcamera.util.PhotoStitcher
+import com.xiaojing.watermarkcamera.util.PlaceLevel
 import com.xiaojing.watermarkcamera.util.WeatherHelper
 import com.xiaojing.watermarkcamera.watermark.WatermarkConfig
 import com.xiaojing.watermarkcamera.watermark.WatermarkRenderer
@@ -35,8 +36,15 @@ enum class GridMode(val label: String) {
     CROSS("十字线")
 }
 
-/** 备注快捷选项（对应参考 App 的「选择备注」） */
-val NOTE_PRESETS = listOf("总表", "电采暖A项", "电采暖B项", "电采暖C项")
+/** 闪光灯模式：关 / 拍照闪光 / 常亮 */
+enum class FlashMode(val label: String) {
+    OFF("关"),
+    ON("闪光"),
+    TORCH("常亮")
+}
+
+/** 备注默认快捷选项（可自行增删） */
+val DEFAULT_NOTE_PRESETS = listOf("总表", "电采暖A项", "电采暖B项", "电采暖C项")
 
 data class WatermarkUiState(
     val showTime: Boolean = true,
@@ -47,6 +55,7 @@ data class WatermarkUiState(
     val note: String = "",
     val location: String = "",
     val weather: String = "",
+    val placeLevel: PlaceLevel = PlaceLevel.STREET,
     val locationLoading: Boolean = false,
     val shooting: Boolean = false,
     val toast: String? = null,
@@ -57,7 +66,9 @@ data class WatermarkUiState(
     val stitching: Boolean = false,
     val pendingCount: Int = 0,
     val stitchColumns: Int = 2,
-    val busy: Boolean = false
+    val busy: Boolean = false,
+    // 自定义备注
+    val notePresets: List<String> = DEFAULT_NOTE_PRESETS
 )
 
 class CameraViewModel(app: Application) : AndroidViewModel(app) {
@@ -87,6 +98,24 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         it.copy(note = text, showNote = text.isNotBlank())
     }
 
+    /** 把当前输入的备注加进快捷列表 */
+    fun addNotePreset(text: String) {
+        val t = text.trim()
+        if (t.isEmpty()) {
+            _state.update { it.copy(toast = "先输入备注内容再添加") }
+            return
+        }
+        _state.update {
+            if (it.notePresets.contains(t)) it.copy(toast = "该备注已存在")
+            else it.copy(notePresets = it.notePresets + t, toast = "已添加备注：$t")
+        }
+    }
+
+    /** 从快捷列表移除一条备注 */
+    fun removeNotePreset(text: String) = _state.update {
+        it.copy(notePresets = it.notePresets - text)
+    }
+
     fun consumeToast() = _state.update { it.copy(toast = null) }
 
     fun setToast(msg: String) = _state.update { it.copy(toast = msg) }
@@ -94,6 +123,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun setRatio(ratio: CaptureRatio) = _state.update { it.copy(ratio = ratio) }
 
     fun setGrid(grid: GridMode) = _state.update { it.copy(grid = grid) }
+
+    fun setPlaceLevel(level: PlaceLevel) {
+        _state.update { it.copy(placeLevel = level) }
+        refreshLocation()
+    }
 
     fun toggleStitching() = _state.update { it.copy(stitching = !it.stitching) }
 
@@ -103,8 +137,9 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun refreshLocation() {
         if (_state.value.locationLoading) return
         _state.update { it.copy(locationLoading = true) }
+        val level = _state.value.placeLevel
         viewModelScope.launch {
-            val place = LocationHelper.currentPlace(getApplication())
+            val place = LocationHelper.currentPlace(getApplication(), level)
             val weather = place?.let { WeatherHelper.current(it.lat, it.lon) }.orEmpty()
             _state.update {
                 it.copy(
@@ -159,7 +194,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     shooting = false,
                     pendingCount = pending.size,
                     toast = when {
-                        it.stitching -> "已暂存第 " + pending.size + " 张，点「拼接保存」合成"
+                        it.stitching -> "已暂存第 " + pending.size + " 张"
                         result == null -> "保存失败，请检查存储权限"
                         else -> "已保存到相册/WatermarkCamera"
                     }
@@ -199,7 +234,8 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 it.copy(
                     busy = false,
                     pendingCount = pending.size,
-                    toast = if (path == null) "拼接失败，请重试" else "已拼成 " + PhotoStitcher.columnLabel(columns) + "长图并保存"
+                    toast = if (path == null) "拼接失败，请重试"
+                    else "已拼成 " + PhotoStitcher.columnLabel(columns) + "长图并保存"
                 )
             }
         }

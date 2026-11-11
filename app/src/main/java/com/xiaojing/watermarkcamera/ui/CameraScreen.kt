@@ -5,6 +5,7 @@ import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.AspectRatio
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
@@ -15,12 +16,16 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
@@ -37,7 +42,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -46,6 +50,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xiaojing.watermarkcamera.util.PlaceLevel
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -66,10 +71,10 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
         )
     }
     var showPanel by remember { mutableStateOf(false) }
-    var showStitchPanel by remember { mutableStateOf(false) }
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
-    var flashOn by remember { mutableStateOf(false) }
+    var flashMode by remember { mutableStateOf(FlashMode.OFF) }
     var hasFlashUnit by remember { mutableStateOf(true) }
+    var camera by remember { mutableStateOf<Camera?>(null) }
     var capture by remember { mutableStateOf<ImageCapture?>(null) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
@@ -131,27 +136,37 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
 
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         try {
-            val camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+            val bound = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+            camera = bound
             // 前置摄像头通常没有闪光灯，记录下来供按钮提示
-            hasFlashUnit = camera.cameraInfo.hasFlashUnit()
-            if (!hasFlashUnit) flashOn = false
+            hasFlashUnit = bound.cameraInfo.hasFlashUnit()
+            if (!hasFlashUnit) flashMode = FlashMode.OFF
         } catch (e: Exception) {
             // 绑定失败时不崩溃，界面给出提示
         }
     }
 
-    // 闪光灯：绑定相机或切换开关后都要重新下发（重绑相机会新建 ImageCapture，flashMode 会回到默认）
-    LaunchedEffect(flashOn, capture, hasFlashUnit) {
+    // 闪光灯：重绑相机会新建 ImageCapture，flashMode 会回到默认，需重新下发；常亮走 cameraControl
+    LaunchedEffect(flashMode, capture, hasFlashUnit, camera) {
         val cap = capture ?: return@LaunchedEffect
-        cap.flashMode = if (flashOn && hasFlashUnit) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF
+        cap.flashMode = if (flashMode == FlashMode.ON && hasFlashUnit) {
+            ImageCapture.FLASH_MODE_ON
+        } else {
+            ImageCapture.FLASH_MODE_OFF
+        }
+        camera?.cameraControl?.enableTorch(flashMode == FlashMode.TORCH && hasFlashUnit)
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { camera?.cameraControl?.enableTorch(false) }
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (hasCamera) {
-            // 取景框：4:3 时居中留边，全屏时铺满
+            // 取景窗上移：贴顶显示，把下方留给控制区与水印
             Box(
                 modifier = if (state.ratio == CaptureRatio.RATIO_4_3) {
-                    Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.Center)
+                    Modifier.fillMaxWidth().aspectRatio(3f / 4f).align(Alignment.TopCenter)
                 } else {
                     Modifier.fillMaxSize()
                 }
@@ -170,6 +185,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                 // 参考线
                 GridOverlay(mode = state.grid, modifier = Modifier.fillMaxSize())
 
+                // 水印预览：可点击打开设置
                 WatermarkOverlay(
                     showTime = state.showTime,
                     showDate = state.showDate,
@@ -179,10 +195,21 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                     location = state.location,
                     weather = state.weather,
                     note = state.note,
+                    onClick = { showPanel = true },
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .fillMaxWidth()
                         .padding(start = 18.dp, end = 18.dp, bottom = 20.dp)
+                )
+
+                // 边拍边拼快捷键：取景窗左侧
+                StitchShortcut(
+                    active = state.stitching,
+                    pendingCount = state.pendingCount,
+                    onClick = { vm.toggleStitching() },
+                    modifier = Modifier
+                        .align(Alignment.CenterStart)
+                        .padding(start = 10.dp)
                 )
             }
 
@@ -194,18 +221,36 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    // 闪光灯三档：关 → 闪光 → 常亮
                     RoundIconButton(onClick = {
                         if (!hasFlashUnit) {
                             vm.setToast("当前摄像头没有闪光灯")
                         } else {
-                            flashOn = !flashOn
+                            flashMode = when (flashMode) {
+                                FlashMode.OFF -> FlashMode.ON
+                                FlashMode.ON -> FlashMode.TORCH
+                                FlashMode.TORCH -> FlashMode.OFF
+                            }
                         }
                     }) {
                         Icon(
-                            imageVector = if (flashOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
+                            imageVector = if (flashMode == FlashMode.OFF) Icons.Filled.FlashOff else Icons.Filled.FlashOn,
                             contentDescription = "闪光灯",
-                            tint = if (flashOn) ACCENT else Color.White
+                            tint = if (flashMode == FlashMode.OFF) Color.White else ACCENT
                         )
+                        if (flashMode == FlashMode.TORCH) {
+                            // 常亮模式右下角标「亮」
+                            Box(
+                                Modifier
+                                    .align(Alignment.BottomEnd)
+                                    .padding(4.dp)
+                                    .clip(RoundedCornerShape(4.dp))
+                                    .background(ACCENT)
+                                    .padding(horizontal = 3.dp)
+                            ) {
+                                Text("亮", color = Color(0xFF0B1B2B), fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                            }
+                        }
                     }
                     RoundIconButton(onClick = {
                         vm.setGrid(
@@ -246,12 +291,22 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                 }
             }
 
+            // 点面板外面关闭设置
+            if (showPanel) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(Color(0x33000000))
+                        .clickable { showPanel = false }
+                )
+            }
+
             // 底部控制区
             Column(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .fillMaxWidth()
-                    .padding(bottom = 36.dp),
+                    .padding(bottom = 28.dp),
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 AnimatedVisibility(visible = showPanel, enter = fadeIn(), exit = fadeOut()) {
@@ -263,16 +318,14 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         onToggleLocation = vm::toggleLocation,
                         onToggleNote = vm::toggleNote,
                         onNoteChange = vm::setNote,
-                        onPickNote = vm::pickNote
-                    )
-                }
-                AnimatedVisibility(visible = showStitchPanel, enter = fadeIn(), exit = fadeOut()) {
-                    StitchPanel(
-                        state = state,
+                        onPickNote = vm::pickNote,
+                        onAddPreset = vm::addNotePreset,
+                        onRemovePreset = vm::removeNotePreset,
+                        onPlaceLevel = vm::setPlaceLevel,
                         onColumns = vm::setStitchColumns,
-                        onStitch = { vm.stitchAndSave() },
                         onUndo = { vm.undoPending() },
-                        onClear = { vm.clearPending() }
+                        onClear = { vm.clearPending() },
+                        onClose = { showPanel = false }
                     )
                 }
                 Spacer(Modifier.height(16.dp))
@@ -281,7 +334,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    // 边拍边拼开关 + 张数
+                    // 简化后的边拍边拼：一个开关 + 张数
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier
@@ -298,7 +351,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         )
                         if (state.pendingCount > 0) {
                             Text(
-                                "${state.pendingCount} 张",
+                                state.pendingCount.toString() + " 张",
                                 color = if (state.stitching) Color(0xFF0B1B2B) else ACCENT,
                                 fontSize = 10.sp
                             )
@@ -308,7 +361,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                     ShutterButton(enabled = !state.shooting) {
                         val imageCapture = capture ?: return@ShutterButton
                         // 拍照前再下发一次闪光灯，避免重绑相机后状态丢失
-                        imageCapture.flashMode = if (flashOn && hasFlashUnit) {
+                        imageCapture.flashMode = if (flashMode == FlashMode.ON && hasFlashUnit) {
                             ImageCapture.FLASH_MODE_ON
                         } else {
                             ImageCapture.FLASH_MODE_OFF
@@ -331,17 +384,29 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         )
                     }
 
-                    // 拼图面板入口
+                    // 拼接：有暂存直接拼，没有就提示先拍
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
                         modifier = Modifier
                             .clip(RoundedCornerShape(12.dp))
-                            .background(Color(0x66000000))
-                            .clickable { showStitchPanel = !showStitchPanel }
+                            .background(if (state.pendingCount > 0) ACCENT else Color(0x66000000))
+                            .clickable(enabled = !state.busy) {
+                                if (state.pendingCount > 0) vm.stitchAndSave()
+                                else vm.setToast("先开「边拍边拼」拍几张，再点这里合成")
+                            }
                             .padding(horizontal = 10.dp, vertical = 6.dp)
                     ) {
-                        Icon(Icons.Filled.GridOn, "拼图", tint = if (state.pendingCount > 0) ACCENT else Color.White)
-                        Text("拼接", color = Color.White, fontSize = 10.sp)
+                        Text(
+                            "拼接",
+                            color = if (state.pendingCount > 0) Color(0xFF0B1B2B) else Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                        Text(
+                            PhotoColumnsLabel(state.stitchColumns),
+                            color = if (state.pendingCount > 0) Color(0xFF0B1B2B) else Color(0x99FFFFFF),
+                            fontSize = 10.sp
+                        )
                     }
                 }
                 Spacer(Modifier.height(12.dp))
@@ -396,6 +461,47 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
     }
 }
 
+/** 边拍边拼快捷键：取景窗左侧的竖排小按钮 */
+@Composable
+private fun StitchShortcut(
+    active: Boolean,
+    pendingCount: Int,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(12.dp))
+            .background(if (active) ACCENT else Color(0x66000000))
+            .clickable { onClick() }
+            .padding(horizontal = 8.dp, vertical = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            "拼",
+            color = if (active) Color(0xFF0B1B2B) else Color.White,
+            fontSize = 15.sp,
+            fontWeight = FontWeight.Bold
+        )
+        if (pendingCount > 0) {
+            Text(
+                pendingCount.toString(),
+                color = if (active) Color(0xFF0B1B2B) else ACCENT,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+/** 列数对应的短标签，用于底部按钮 */
+private fun PhotoColumnsLabel(columns: Int): String = when (columns) {
+    1 -> "单列"
+    2 -> "两列"
+    3 -> "三列"
+    else -> "四列"
+}
+
 /** 取景参考线：九宫格或十字线 */
 @Composable
 private fun GridOverlay(mode: GridMode, modifier: Modifier = Modifier) {
@@ -427,6 +533,7 @@ private fun WatermarkOverlay(
     location: String,
     weather: String,
     note: String,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     if (!showTime && !showDate && !showLocation && !showNote && !(showWeather && weather.isNotBlank())) return
@@ -441,12 +548,13 @@ private fun WatermarkOverlay(
     val weekText = SimpleDateFormat("EEEE", Locale.CHINA).format(now)
     val weatherText = if (showWeather) weather.trim() else ""
     val weekLine = when {
-        showDate && weatherText.isNotEmpty() -> "$weekText  $weatherText"
+        showDate && weatherText.isNotEmpty() -> weekText + "  " + weatherText
         showDate -> weekText
         else -> weatherText
     }
 
-    Column(modifier = modifier) {
+    // 整块水印可点击，点一下打开水印设置
+    Column(modifier = modifier.clickable { onClick() }) {
         // 头行：时间在黄线左侧，高度与右侧两行小字对齐
         Row(
             modifier = Modifier.height(IntrinsicSize.Min),
@@ -456,110 +564,45 @@ private fun WatermarkOverlay(
                 Text(
                     SimpleDateFormat("HH:mm", Locale.getDefault()).format(now),
                     color = Color.White,
-                    fontSize = 34.sp,
+                    fontSize = 40.sp,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.align(Alignment.Bottom)
                 )
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(9.dp))
             }
             if (showDate || weekLine.isNotBlank()) {
                 Box(
                     Modifier
-                        .width(3.dp)
+                        .width(4.dp)
                         .fillMaxHeight()
                         .clip(RoundedCornerShape(2.dp))
                         .background(ACCENT)
                 )
-                Spacer(Modifier.width(8.dp))
+                Spacer(Modifier.width(9.dp))
                 Column {
                     if (showDate) {
-                        Text(dateText, color = Color(0xE6FFFFFF), fontSize = 13.sp)
+                        Text(dateText, color = Color(0xE6FFFFFF), fontSize = 15.sp)
                     }
                     if (weekLine.isNotBlank()) {
-                        Text(weekLine, color = Color(0xE6FFFFFF), fontSize = 12.sp)
+                        Text(weekLine, color = Color(0xE6FFFFFF), fontSize = 14.sp)
                     }
                 }
             }
         }
         // 地点、备注整行左对齐
         if (showLocation && location.isNotBlank()) {
-            Spacer(Modifier.height(3.dp))
-            Text(location, color = Color(0xE6FFFFFF), fontSize = 12.sp, maxLines = 2)
+            Spacer(Modifier.height(4.dp))
+            Text(location, color = Color(0xE6FFFFFF), fontSize = 14.sp, maxLines = 2)
         }
         if (showNote && note.isNotBlank()) {
-            Spacer(Modifier.height(3.dp))
-            Text("备注： " + note, color = ACCENT, fontSize = 12.sp, maxLines = 1)
+            Spacer(Modifier.height(4.dp))
+            Text("备注： " + note, color = ACCENT, fontSize = 14.sp, maxLines = 1)
         }
     }
 }
 
-/** 边拍边拼面板：列数选择 + 拼接/撤销/清空 */
-@Composable
-private fun StitchPanel(
-    state: WatermarkUiState,
-    onColumns: (Int) -> Unit,
-    onStitch: () -> Unit,
-    onUndo: () -> Unit,
-    onClear: () -> Unit
-) {
-    Column(
-        Modifier
-            .padding(horizontal = 16.dp)
-            .clip(RoundedCornerShape(18.dp))
-            .background(Color(0xCC101F2E))
-            .padding(horizontal = 16.dp, vertical = 12.dp)
-    ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween
-        ) {
-            Text("拼图列数", color = Color.White, fontSize = 14.sp)
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                for (n in 1..4) {
-                    val selected = state.stitchColumns == n
-                    Box(
-                        Modifier
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(if (selected) ACCENT else Color(0x33FFFFFF))
-                            .clickable { onColumns(n) }
-                            .padding(horizontal = 12.dp, vertical = 5.dp)
-                    ) {
-                        Text(
-                            "${n}列",
-                            color = if (selected) Color(0xFF0B1B2B) else Color.White,
-                            fontSize = 12.sp,
-                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
-                        )
-                    }
-                }
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "已暂存 ${state.pendingCount} 张",
-            color = Color(0x99FFFFFF),
-            fontSize = 12.sp
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(
-            Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Button(
-                onClick = onStitch,
-                enabled = state.pendingCount > 0 && !state.busy,
-                modifier = Modifier.weight(1f),
-                colors = ButtonDefaults.buttonColors(containerColor = ACCENT)
-            ) {
-                Text("拼接保存", color = Color(0xFF0B1B2B), fontWeight = FontWeight.Bold)
-            }
-            OutlinedButton(onClick = onUndo, enabled = state.pendingCount > 0) { Text("撤销") }
-            OutlinedButton(onClick = onClear, enabled = state.pendingCount > 0) { Text("清空") }
-        }
-    }
-}
-
+/** 水印设置面板：点面板外或右上角 × 关闭 */
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun WatermarkPanel(
     state: WatermarkUiState,
@@ -569,34 +612,150 @@ private fun WatermarkPanel(
     onToggleLocation: () -> Unit,
     onToggleNote: () -> Unit,
     onNoteChange: (String) -> Unit,
-    onPickNote: (String) -> Unit
+    onPickNote: (String) -> Unit,
+    onAddPreset: (String) -> Unit,
+    onRemovePreset: (String) -> Unit,
+    onPlaceLevel: (PlaceLevel) -> Unit,
+    onColumns: (Int) -> Unit,
+    onUndo: () -> Unit,
+    onClear: () -> Unit,
+    onClose: () -> Unit
 ) {
     Column(
         Modifier
             .padding(horizontal = 16.dp)
             .clip(RoundedCornerShape(18.dp))
-            .background(Color(0xCC101F2E))
+            .background(Color(0xF2101F2E))
+            .clickable(enabled = false) {}   // 吞掉点击，避免点到面板内部就关闭
             .padding(horizontal = 16.dp, vertical = 12.dp)
     ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text("水印设置", color = Color.White, fontSize = 15.sp, fontWeight = FontWeight.Bold)
+            IconButton(onClick = onClose, modifier = Modifier.size(28.dp)) {
+                Icon(Icons.Filled.Close, "关闭", tint = Color(0x99FFFFFF), modifier = Modifier.size(18.dp))
+            }
+        }
+
         ToggleRow("时间", state.showTime, onToggleTime)
         ToggleRow("日期", state.showDate, onToggleDate)
         ToggleRow("天气", state.showWeather, onToggleWeather)
         ToggleRow("地点", state.showLocation, onToggleLocation)
         ToggleRow("备注", state.showNote, onToggleNote)
 
-        // 备注快捷选项：总表 / 电采暖A项 / 电采暖B项 / 电采暖C项
-        if (state.showNote) {
+        // 定位粒度：省 / 市 / 区 / 街道 / 地点
+        if (state.showLocation) {
+            Spacer(Modifier.height(4.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("定位到", color = Color(0xCCFFFFFF), fontSize = 12.sp)
+                Spacer(Modifier.width(8.dp))
+                Row(
+                    Modifier.horizontalScroll(androidx.compose.foundation.rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    for (level in PlaceLevel.entries) {
+                        val selected = state.placeLevel == level
+                        Box(
+                            Modifier
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (selected) ACCENT else Color(0x33FFFFFF))
+                                .clickable { onPlaceLevel(level) }
+                                .padding(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Text(
+                                level.label,
+                                color = if (selected) Color(0xFF0B1B2B) else Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                            )
+                        }
+                    }
+                }
+            }
+            if (state.location.isNotBlank()) {
+                Text(
+                    state.location,
+                    color = Color(0x80FFFFFF),
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+        }
+
+        // 拼图列数（边拍边拼合成用）
+        Spacer(Modifier.height(6.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("拼图列数", color = Color(0xCCFFFFFF), fontSize = 12.sp)
+            Spacer(Modifier.width(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                for (n in 1..4) {
+                    val selected = state.stitchColumns == n
+                    Box(
+                        Modifier
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(if (selected) ACCENT else Color(0x33FFFFFF))
+                            .clickable { onColumns(n) }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            n.toString() + "列",
+                            color = if (selected) Color(0xFF0B1B2B) else Color.White,
+                            fontSize = 11.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal
+                        )
+                    }
+                }
+            }
+        }
+        if (state.pendingCount > 0) {
             Row(
                 Modifier.fillMaxWidth().padding(top = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("已暂存 " + state.pendingCount + " 张", color = Color(0x99FFFFFF), fontSize = 11.sp)
+                Spacer(Modifier.weight(1f))
+                Text(
+                    "撤销",
+                    color = ACCENT,
+                    fontSize = 11.sp,
+                    modifier = Modifier.clickable { onUndo() }.padding(horizontal = 8.dp, vertical = 2.dp)
+                )
+                Text(
+                    "清空",
+                    color = Color(0x99FFFFFF),
+                    fontSize = 11.sp,
+                    modifier = Modifier.clickable { onClear() }.padding(horizontal = 8.dp, vertical = 2.dp)
+                )
+            }
+        }
+
+        // 备注：快捷选项（长按删除）+ 自定义添加
+        if (state.showNote) {
+            Spacer(Modifier.height(6.dp))
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(androidx.compose.foundation.rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                for (preset in NOTE_PRESETS) {
+                for (preset in state.notePresets) {
                     val selected = state.note == preset
                     Box(
                         Modifier
                             .clip(RoundedCornerShape(8.dp))
                             .background(if (selected) ACCENT else Color(0x33FFFFFF))
-                            .clickable { onPickNote(if (selected) "" else preset) }
+                            .combinedClickable(
+                                onClick = { onPickNote(if (selected) "" else preset) },
+                                onLongClick = { onRemovePreset(preset) }
+                            )
                             .padding(horizontal = 10.dp, vertical = 5.dp)
                     ) {
                         Text(
@@ -608,12 +767,34 @@ private fun WatermarkPanel(
                     }
                 }
             }
-            OutlinedTextField(
-                value = state.note,
-                onValueChange = onNoteChange,
-                placeholder = { Text("以上都没有，自行填写", color = Color(0x80FFFFFF)) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+            Row(
+                Modifier.fillMaxWidth().padding(top = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedTextField(
+                    value = state.note,
+                    onValueChange = onNoteChange,
+                    placeholder = { Text("输入备注内容", color = Color(0x80FFFFFF), fontSize = 12.sp) },
+                    singleLine = true,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(Modifier.width(8.dp))
+                // 把当前内容存成快捷项
+                IconButton(
+                    onClick = { onAddPreset(state.note) },
+                    modifier = Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .background(Color(0x33FFFFFF))
+                ) {
+                    Icon(Icons.Filled.Add, "添加为快捷备注", tint = Color.White, modifier = Modifier.size(18.dp))
+                }
+            }
+            Text(
+                "长按快捷备注可删除",
+                color = Color(0x66FFFFFF),
+                fontSize = 10.sp,
+                modifier = Modifier.padding(top = 2.dp)
             )
         }
     }
@@ -635,12 +816,17 @@ private fun ToggleRow(label: String, checked: Boolean, onChange: () -> Unit) {
 private fun RoundIconButton(
     onClick: () -> Unit,
     size: androidx.compose.ui.unit.Dp = 44.dp,
-    content: @Composable () -> Unit
+    content: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit
 ) {
-    IconButton(
-        onClick = onClick,
-        modifier = Modifier.size(size).clip(CircleShape).background(Color(0x66000000))
-    ) { content() }
+    Box(
+        modifier = Modifier
+            .size(size)
+            .clip(CircleShape)
+            .background(Color(0x66000000))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+        content = content
+    )
 }
 
 @Composable
