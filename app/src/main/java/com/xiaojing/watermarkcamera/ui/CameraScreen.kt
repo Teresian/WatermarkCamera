@@ -197,25 +197,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                 Modifier.fillMaxSize()
             }
 
-            Box(
-                modifier = viewfinderModifier
-                    // 双指缩放改倍数（单指完全放行，不影响点击）
-                    .pointerInput(Unit) {
-                        awaitEachGesture {
-                            awaitFirstDown(requireUnconsumed = false)
-                            do {
-                                val event = awaitPointerEvent()
-                                if (event.changes.size >= 2) {
-                                    val zoom = event.calculateZoom()
-                                    if (zoom != 1f && zoom.isFinite()) {
-                                        vm.zoomBy(zoom)
-                                        event.changes.forEach { it.consume() }
-                                    }
-                                }
-                            } while (event.changes.any { it.pressed })
-                        }
-                    }
-            ) {
+            Box(modifier = viewfinderModifier) {
                 AndroidView(
                     factory = { ctx ->
                         PreviewView(ctx).apply {
@@ -224,6 +206,12 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                             previewView = this
                         }
                     },
+                    modifier = Modifier.fillMaxSize()
+                )
+
+                // 双指缩放层：盖在预览上，单指不消费事件，点击照常穿透到水印
+                ZoomGestureLayer(
+                    onZoom = { vm.zoomBy(it) },
                     modifier = Modifier.fillMaxSize()
                 )
 
@@ -539,6 +527,28 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
             modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 12.dp)
         )
     }
+}
+
+/** 双指缩放层：只有两根手指同时按下时才消费事件，单指放行 */
+@Composable
+private fun ZoomGestureLayer(onZoom: (Float) -> Unit, modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier.pointerInput(Unit) {
+            awaitEachGesture {
+                awaitFirstDown(requireUnconsumed = false)
+                do {
+                    val event = awaitPointerEvent()
+                    if (event.changes.count { it.pressed } >= 2) {
+                        val zoom = event.calculateZoom()
+                        if (zoom != 1f && zoom.isFinite()) {
+                            onZoom(zoom)
+                            event.changes.forEach { it.consume() }
+                        }
+                    }
+                } while (event.changes.any { it.pressed })
+            }
+        }
+    )
 }
 
 /** 取景框右下角：没拍照=拼图设置，有暂存=拼图确定（长按始终打开设置） */
