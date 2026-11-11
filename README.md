@@ -7,6 +7,9 @@
 ## 功能
 
 - 📷 CameraX 实时预览，前后摄像头一键切换，支持闪光灯
+- 🖼️ 画幅切换：4:3 / 全屏，预览与成片比例一致
+- 📐 取景参考线：九宫格、十字线循环切换
+- 🧩 边拍边拼：照片先暂存不落相册，拍够后按 1~4 列一键拼成长图，支持撤销与清空
 - 🕒 实时时间/日期水印，所见即所得
 - 📍 自动定位并把坐标反解成可读地名（省 · 市 · 区 · 街道），无地名时回退显示经纬度
 - ✍️ 自定义备注文字水印
@@ -52,14 +55,15 @@ Windows 下可以用 `gradlew.bat`。首次构建需要联网拉依赖。
 app/src/main/java/com/xiaojing/watermarkcamera/
 ├── MainActivity.kt            # 入口，Material3 深色主题
 ├── ui/
-│   ├── CameraScreen.kt        # 相机界面、水印预览叠层、设置面板
-│   └── CameraViewModel.kt     # 拍摄后处理流水线（解码 → 旋转校正 → 烧水印 → 存相册）
+│   ├── CameraScreen.kt        # 相机界面、参考线、水印预览叠层、设置与拼图面板
+│   └── CameraViewModel.kt     # 拍摄后处理流水线（解码 → 旋转校正 → 烧水印 → 存相册/暂存拼图）
 ├── watermark/
 │   ├── WatermarkConfig.kt     # 水印开关与内容
 │   └── WatermarkRenderer.kt   # Canvas 烧录水印（渐变遮罩 + 强调竖线 + 自动省略）
 └── util/
     ├── LocationHelper.kt      # 定位 + Geocoder 反解地名
-    └── ImageSaver.kt          # MediaStore / 文件两种保存路径
+    ├── ImageSaver.kt          # MediaStore / 文件两种保存路径
+    └── PhotoStitcher.kt       # 多图拼长图（1~4 列，最短列优先分配）
 ```
 
 ## 权限说明
