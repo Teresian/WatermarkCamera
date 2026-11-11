@@ -12,6 +12,8 @@ android {
         applicationId = "com.xiaojing.watermarkcamera"
         minSdk = 24
         targetSdk = 34
+        // 版本规则：默认只递增最后一位（0.0.x）；主次版本号需人工确认才动。
+        // RC 标签按顺序往后加：RC1、RC2、RC3……
         versionCode = 4
         versionName = "0.0.2-RC3"
         vectorDrawables { useSupportLibrary = true }
@@ -57,6 +59,18 @@ android {
 
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
+    }
+}
+
+// 安装包名：WatermarkCamera-<版本号>.apk（如 WatermarkCamera-0.0.4-RC3.apk）
+androidComponents {
+    onVariants { variant ->
+        variant.outputs.forEach { output ->
+            val vName = variant.outputs.first().versionName.get()
+            // AGP 8 的 VariantOutput 接口不暴露 outputFileName，用实现类设置
+            val impl = output as? com.android.build.api.variant.impl.VariantOutputImpl
+            impl?.outputFileName?.set("WatermarkCamera-" + vName + ".apk")
+        }
     }
 }
 
