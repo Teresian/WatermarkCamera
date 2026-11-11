@@ -17,7 +17,9 @@
 
 ## 下载 APK
 
-到 [Releases](../../releases) 页面下载最新的 `WatermarkCamera-*.apk`，传到手机上安装即可（Android 7.0 / API 24 及以上）。
+到 [Releases](https://github.com/Teresian/WatermarkCamera/releases/latest) 页面下载 `app-release.apk`，传到手机上安装即可（Android 7.0 / API 24 及以上）。
+
+> 该 APK 使用 debug 签名，适合自用安装。若要上架应用商店，请用下面的环境变量配置自己的 keystore 重新打包。
 
 ## 自己构建
 
