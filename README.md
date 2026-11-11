@@ -24,14 +24,18 @@
 
 ## 版本号规则
 
-- 安装包名：`WatermarkCamera-<版本号>.apk`，例如 `WatermarkCamera-0.0.4-RC3.apk`
-- 版本号从首版 `0.0.1` 起，默认**只递增最后一位**（`0.0.1 → 0.0.2 → 0.0.3 …`）
+- 安装包名：`WatermarkCamera-<版本号>.apk`，例如 `WatermarkCamera-0.0.2-RC1.apk`
+- 正式版从 `0.0.1` 起，默认**只递增最后一位**（`0.0.1 → 0.0.2 → 0.0.3 …`）
 - 主版本 / 次版本号（第一位、第二位）需要人工确认才能动
-- 测试版按顺序加 RC 后缀：`RC1`、`RC2`、`RC3`……
+- **RC 是预览版，不进正式版本号**：先定好下一个正式版本号，之后所有 RC 都挂在它下面，只递增 RC 序号
+  - 正式版 `0.0.1` → 预览版 `0.0.2-RC1` → `0.0.2-RC2` → `0.0.2-RC3` …（前置版本号不动）
+- GitHub Release 里 RC 一律勾选 **Pre-release**，`/releases/latest` 只会指向正式版
 
 ## 下载 APK
 
-到 [Releases](https://github.com/Teresian/WatermarkCamera/releases/latest) 页面下载最新版的 `WatermarkCamera-<版本号>.apk`，传到手机上安装即可（Android 7.0 / API 24 及以上）。
+到 [Releases](https://github.com/Teresian/WatermarkCamera/releases) 页面下载 `WatermarkCamera-<版本号>.apk`，传到手机上安装即可（Android 7.0 / API 24 及以上）。
+
+> 带 `RC` 的是预览版，功能新但可能不稳定；[最新正式版](https://github.com/Teresian/WatermarkCamera/releases/latest) 不带 RC。
 
 > 该 APK 使用 debug 签名，适合自用安装。若要上架应用商店，请用下面的环境变量配置自己的 keystore 重新打包。
 
