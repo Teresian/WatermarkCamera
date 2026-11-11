@@ -69,6 +69,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
     var showStitchPanel by remember { mutableStateOf(false) }
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
     var flashOn by remember { mutableStateOf(false) }
+    var hasFlashUnit by remember { mutableStateOf(true) }
     var capture by remember { mutableStateOf<ImageCapture?>(null) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
@@ -130,14 +131,19 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
 
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         try {
-            provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+            val camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+            // 前置摄像头通常没有闪光灯，记录下来供按钮提示
+            hasFlashUnit = camera.cameraInfo.hasFlashUnit()
+            if (!hasFlashUnit) flashOn = false
         } catch (e: Exception) {
             // 绑定失败时不崩溃，界面给出提示
         }
     }
 
-    LaunchedEffect(flashOn) {
-        capture?.flashMode = if (flashOn) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF
+    // 闪光灯：绑定相机或切换开关后都要重新下发（重绑相机会新建 ImageCapture，flashMode 会回到默认）
+    LaunchedEffect(flashOn, capture, hasFlashUnit) {
+        val cap = capture ?: return@LaunchedEffect
+        cap.flashMode = if (flashOn && hasFlashUnit) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
@@ -188,7 +194,13 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    RoundIconButton(onClick = { flashOn = !flashOn }) {
+                    RoundIconButton(onClick = {
+                        if (!hasFlashUnit) {
+                            vm.setToast("当前摄像头没有闪光灯")
+                        } else {
+                            flashOn = !flashOn
+                        }
+                    }) {
                         Icon(
                             imageVector = if (flashOn) Icons.Filled.FlashOn else Icons.Filled.FlashOff,
                             contentDescription = "闪光灯",
@@ -295,6 +307,12 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
 
                     ShutterButton(enabled = !state.shooting) {
                         val imageCapture = capture ?: return@ShutterButton
+                        // 拍照前再下发一次闪光灯，避免重绑相机后状态丢失
+                        imageCapture.flashMode = if (flashOn && hasFlashUnit) {
+                            ImageCapture.FLASH_MODE_ON
+                        } else {
+                            ImageCapture.FLASH_MODE_OFF
+                        }
                         val file = java.io.File(context.cacheDir, "wm_capture_" + System.currentTimeMillis() + ".jpg")
                         val options = ImageCapture.OutputFileOptions.Builder(file).build()
                         imageCapture.takePicture(
@@ -307,6 +325,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
 
                                 override fun onError(exception: ImageCaptureException) {
                                     file.delete()
+                                    vm.setToast("拍照失败：" + (exception.message ?: "未知错误"))
                                 }
                             }
                         )

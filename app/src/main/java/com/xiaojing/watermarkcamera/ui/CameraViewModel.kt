@@ -89,6 +89,8 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun consumeToast() = _state.update { it.copy(toast = null) }
 
+    fun setToast(msg: String) = _state.update { it.copy(toast = msg) }
+
     fun setRatio(ratio: CaptureRatio) = _state.update { it.copy(ratio = ratio) }
 
     fun setGrid(grid: GridMode) = _state.update { it.copy(grid = grid) }
