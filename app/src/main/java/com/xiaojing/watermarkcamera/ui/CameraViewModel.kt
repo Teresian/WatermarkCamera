@@ -86,13 +86,16 @@ data class WatermarkUiState(
     val notePresets: List<String> = DEFAULT_NOTE_PRESETS,
     // 闪光灯（持久化，重开应用保留）
     val flashMode: FlashMode = FlashMode.OFF,
+    // 拍摄模式（持久化，重开应用保留）
+    val captureMode: CaptureMode = CaptureMode.PHOTO,
+    // 视频录制中
+    val recording: Boolean = false,
+    val recordSeconds: Int = 0,
     // 变焦倍数
     val zoomRatio: Float = 1f,
     val maxZoom: Float = 8f,
     // 拼图设置面板
-    val showStitchPanel: Boolean = false,
-    // 拍摄模式：照片 / 视频
-    val captureMode: CaptureMode = CaptureMode.PHOTO
+    val showStitchPanel: Boolean = false
 )
 
 class CameraViewModel(app: Application) : AndroidViewModel(app) {
@@ -111,7 +114,9 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 .getOrDefault(PlaceLevel.POI),
             locationMode = runCatching {
                 LocationDisplayMode.valueOf(prefs.getString(KEY_LOCATION_MODE, LocationDisplayMode.ADDRESS.name)!!)
-            }.getOrDefault(LocationDisplayMode.ADDRESS)
+            }.getOrDefault(LocationDisplayMode.ADDRESS),
+            captureMode = runCatching { CaptureMode.valueOf(prefs.getString(KEY_CAPTURE_MODE, CaptureMode.PHOTO.name)!!) }
+                .getOrDefault(CaptureMode.PHOTO)
         )
     )
     val state: StateFlow<WatermarkUiState> = _state.asStateFlow()
@@ -189,6 +194,34 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         _state.update { it.copy(flashMode = mode) }
     }
 
+    /** 切换拍摄模式：录制中不允许切换 */
+    fun setCaptureMode(mode: CaptureMode) {
+        if (_state.value.recording) {
+            setToast("请先停止录制再切换模式")
+            return
+        }
+        prefs.edit().putString(KEY_CAPTURE_MODE, mode.name).apply()
+        _state.update { it.copy(captureMode = mode) }
+    }
+
+    /** 录制状态：开始时计时清零并启动秒表协程 */
+    fun setRecording(recording: Boolean) {
+        _state.update { it.copy(recording = recording, recordSeconds = if (recording) 0 else it.recordSeconds) }
+        if (!recording) {
+            tickJob?.cancel()
+            tickJob = null
+        } else {
+            tickJob = viewModelScope.launch {
+                while (true) {
+                    kotlinx.coroutines.delay(1000)
+                    _state.update { it.copy(recordSeconds = it.recordSeconds + 1) }
+                }
+            }
+        }
+    }
+
+    private var tickJob: kotlinx.coroutines.Job? = null
+
     /** 点一下循环切换闪光灯，返回切换后的模式（无闪光灯时返回 null） */
     fun cycleFlashMode(hasFlashUnit: Boolean): FlashMode? {
         if (!hasFlashUnit) {
@@ -221,14 +254,6 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setShowStitchPanel(show: Boolean) = _state.update { it.copy(showStitchPanel = show) }
 
-    fun setCaptureMode(mode: CaptureMode) {
-        if (mode == CaptureMode.VIDEO) {
-            setToast("视频拍摄暂未开放，请先使用照片模式")
-            return
-        }
-        _state.update { it.copy(captureMode = CaptureMode.PHOTO) }
-    }
-
     fun setPlaceLevel(level: PlaceLevel) {
         prefs.edit().putString(KEY_PLACE_LEVEL, level.name).apply()
         _state.update { it.copy(placeLevel = level) }
@@ -255,7 +280,14 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun toggleStitching() = _state.update { it.copy(stitching = !it.stitching) }
+    /** 视频模式不提供边拍边拼 */
+    fun toggleStitching() {
+        if (_state.value.recording || _state.value.captureMode == CaptureMode.VIDEO) {
+            setToast("视频模式不支持边拍边拼")
+            return
+        }
+        _state.update { it.copy(stitching = !it.stitching) }
+    }
 
     fun setStitchColumns(n: Int) {
         val v = n.coerceIn(1, 4)
@@ -315,7 +347,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                         val bytes = ByteArrayOutputStream().use { bos ->
                             if (!output.compress(Bitmap.CompressFormat.JPEG, 90, bos)) null
                             else bos.toByteArray()
-                        } ?: return@withContext null
+                        }                         ?: return@withContext null
                         // 生成小缩略图供左下预览位显示（不持有大图）
                         val thumb = Bitmap.createScaledBitmap(output, 160, 160, true)
                         synchronized(pendingLock) { pending.add(bytes) }
@@ -441,6 +473,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         const val KEY_COLUMNS = "stitch_columns"
         const val KEY_PLACE_LEVEL = "place_level"
         const val KEY_LOCATION_MODE = "location_mode"
+        const val KEY_CAPTURE_MODE = "capture_mode"
     }
 
     private fun decode(file: File): Bitmap? {

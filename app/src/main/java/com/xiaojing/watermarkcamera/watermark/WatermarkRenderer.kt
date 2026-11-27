@@ -39,13 +39,28 @@ object WatermarkRenderer {
     )
 
     fun render(source: Bitmap, config: WatermarkConfig): Bitmap {
-        if (config.isEmpty()) return source
-
         val w = source.width.toFloat()
         val h = source.height.toFloat()
         val out = Bitmap.createBitmap(source.width, source.height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(out)
         canvas.drawBitmap(source, 0f, 0f, null)
+        drawWatermark(canvas, w, h, config)
+        return out
+    }
+
+    /**
+     * 只画水印（含底部渐变遮罩）到一张透明底位图上，尺寸 [width]x[height]。
+     * 供视频实时烧录使用：透明位图按帧叠加到视频画面上，版式与照片完全一致。
+     */
+    fun renderOverlay(width: Int, height: Int, config: WatermarkConfig): Bitmap? {
+        if (config.isEmpty()) return null
+        val out = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        drawWatermark(Canvas(out), width.toFloat(), height.toFloat(), config)
+        return out
+    }
+
+    private fun drawWatermark(canvas: Canvas, w: Float, h: Float, config: WatermarkConfig) {
+        if (config.isEmpty()) return
 
         // 水印尺寸：整体缩小约 12%，保持版式比例不变，避免过于显眼
         val margin = w * 0.044f
@@ -82,7 +97,7 @@ object WatermarkRenderer {
             fullRows.add(Line("备注：" + config.note, w * 0.033f, 0xFF0B1B2B.toInt(), true, w * 0.012f, badge = true))
         }
 
-        if (!config.showTime && right.isEmpty() && fullRows.isEmpty()) return out
+        if (!config.showTime && right.isEmpty() && fullRows.isEmpty()) return
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         paint.setShadowLayer(w * 0.007f, 0f, w * 0.002f, 0xAA000000.toInt())
@@ -199,7 +214,6 @@ object WatermarkRenderer {
             }
             y += lineHeight(line.size)
         }
-        return out
     }
 
     /** 按像素宽度折行，最多 maxLines 行；超出部分末行省略 */

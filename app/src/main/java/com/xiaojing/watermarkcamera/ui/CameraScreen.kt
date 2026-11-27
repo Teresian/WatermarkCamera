@@ -17,6 +17,14 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FallbackStrategy
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -44,8 +52,10 @@ import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Photo
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapHoriz
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -67,8 +77,12 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xiaojing.watermarkcamera.util.PlaceLevel
+import com.xiaojing.watermarkcamera.watermark.VideoWatermarkDrawer
+import com.xiaojing.watermarkcamera.watermark.WatermarkConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import java.text.SimpleDateFormat
@@ -97,11 +111,20 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         )
     }
+    var hasAudio by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    // 申请录音权限期间用户点了录制：权限结果回来后接着开始录制
+    var pendingStartRecording by remember { mutableStateOf(false) }
     var showPanel by remember { mutableStateOf(false) }
     var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_BACK) }
     var hasFlashUnit by remember { mutableStateOf(true) }
     var camera by remember { mutableStateOf<Camera?>(null) }
     var capture by remember { mutableStateOf<ImageCapture?>(null) }
+    var videoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
+    var activeRecording by remember { mutableStateOf<Recording?>(null) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
     var flashMenuOpen by remember { mutableStateOf(false) }
     var showPlacePicker by remember { mutableStateOf(false) }
@@ -115,6 +138,85 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
     var lastGalleryUri by remember { mutableStateOf<Uri?>(null) }
     val pendingThumb by vm.pendingThumb.collectAsState()
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+    val watermarkDrawer = remember { VideoWatermarkDrawer() }
+
+    /** 用当前水印设置生成快照配置 */
+    fun buildWatermarkConfig(capturedAt: Long): WatermarkConfig = WatermarkConfig(
+        showTime = state.showTime,
+        showDate = state.showDate,
+        showWeather = state.showWeather,
+        showLocation = state.showLocation,
+        showNote = state.showNote,
+        note = state.note,
+        location = state.location,
+        weather = state.weather,
+        timestamp = capturedAt
+    )
+
+    /** 真正开始一段录制，保存到相册 Movies/WatermarkCamera */
+    fun beginRecording(vc: VideoCapture<Recorder>, withAudio: Boolean) {
+        val capturedAt = System.currentTimeMillis()
+        val name = "wm_video_" +
+            java.text.SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(java.util.Date(capturedAt)) + ".mp4"
+        // 1.4.2 的 Builder 不再提供 setDisplayName，改用 ContentValues 指定文件名与保存路径
+        val values = android.content.ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/WatermarkCamera")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+        }
+        val output = MediaStoreOutputOptions.Builder(
+            context.contentResolver,
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+        ).setContentValues(values).build()
+        try {
+            // 开录前先烧上当前水印（OverlayEffect 逐帧叠加，录制期间每分钟刷新时间）
+            watermarkDrawer.apply(buildWatermarkConfig(capturedAt), capturedAt)
+            val pendingRec = vc.output.prepareRecording(context, output)
+            if (withAudio) pendingRec.withAudioEnabled()
+            activeRecording = pendingRec.start(cameraExecutor) { event ->
+                when (event) {
+                    is VideoRecordEvent.Start -> vm.setRecording(true)
+                    is VideoRecordEvent.Finalize -> {
+                        activeRecording = null
+                        vm.setRecording(false)
+                        val uri = event.outputResults.outputUri
+                        if (event.hasError()) {
+                            if (uri != Uri.EMPTY) context.contentResolver.delete(uri, null, null)
+                            vm.setToast("录制失败：" + (event.cause?.message ?: "未知错误"))
+                        } else if (event.recordingStats.recordedDurationNanos < 1_000_000_000L) {
+                            if (uri != Uri.EMPTY) context.contentResolver.delete(uri, null, null)
+                            vm.setToast("录制太短，视频未保存")
+                        } else {
+                            vm.setToast("视频已保存到相册/WatermarkCamera")
+                        }
+                    }
+                    else -> {}
+                }
+            }
+        } catch (e: Exception) {
+            activeRecording = null
+            vm.setToast("无法开始录制：" + (e.message ?: "未知错误"))
+        }
+    }
+
+    /** 快门：视频模式下开始/停止录制 */
+    fun startVideoRecording() {
+        val vc = videoCapture
+        if (vc == null) {
+            vm.setToast("相机未就绪，请稍候")
+            return
+        }
+        if (state.recording) {
+            activeRecording?.stop()
+            return
+        }
+        if (!hasAudio) {
+            // 先走权限申请，结果回来后接着开始录制
+            pendingStartRecording = true
+            return
+        }
+        beginRecording(vc, true)
+    }
 
     // 相册预览：读取本应用最近保存的一张水印照片，点击直接查看大图
     fun refreshGalleryThumb() {
@@ -238,6 +340,40 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
         }
     }
 
+    // 录音权限：首次进入视频模式或开始录制时申请；拒绝则静音录制
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        hasAudio = result[Manifest.permission.RECORD_AUDIO] == true
+        if (pendingStartRecording) {
+            pendingStartRecording = false
+            if (!hasAudio) vm.setToast("未授权录音，视频将没有声音")
+            startVideoRecording()
+        } else if (!hasAudio) {
+            vm.setToast("未授权录音，视频将没有声音")
+        }
+    }
+
+    // pendingStartRecording 置位后统一在这里发起权限申请
+    LaunchedEffect(pendingStartRecording) {
+        if (pendingStartRecording) {
+            audioPermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose { watermarkDrawer.close() }
+    }
+
+    // 切到后台自动停止录制并保存
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) activeRecording?.stop()
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(Unit) {
         val hasLocation = ContextCompat.checkSelfPermission(
             context, Manifest.permission.ACCESS_FINE_LOCATION
@@ -267,8 +403,8 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
         onDispose { cameraExecutor.shutdown() }
     }
 
-    // 绑定相机：画幅切换时重新绑定，保证预览与成片比例一致
-    LaunchedEffect(hasCamera, lensFacing, previewView, state.ratio) {
+    // 绑定相机：画幅、模式、前后摄切换时重新绑定
+    LaunchedEffect(hasCamera, lensFacing, previewView, state.ratio, state.captureMode) {
         val pv = previewView ?: return@LaunchedEffect
         if (!hasCamera) return@LaunchedEffect
         val provider = try {
@@ -294,20 +430,46 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                 .build().also {
                     it.setSurfaceProvider(pv.surfaceProvider)
                 }
-            val imageCapture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .setTargetAspectRatio(targetRatio)
-                .build()
-            capture = imageCapture
 
             val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
-            val bound = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+            val bound = if (state.captureMode == CaptureMode.VIDEO) {
+                // 视频模式：Preview + VideoCapture，水印经 OverlayEffect 实时烧进视频流
+                capture = null
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(
+                        QualitySelector.from(
+                            Quality.FHD,
+                            FallbackStrategy.lowerQualityOrHigherThan(Quality.HD)
+                        )
+                    )
+                    .build()
+                val vc = VideoCapture.withOutput(recorder)
+                videoCapture = vc
+                val group = androidx.camera.core.UseCaseGroup.Builder()
+                    .addUseCase(preview)
+                    .addUseCase(vc)
+                    .addEffect(watermarkDrawer.effect)
+                    .build()
+                provider.bindToLifecycle(lifecycleOwner, selector, group)
+            } else {
+                videoCapture = null
+                val imageCapture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .setTargetAspectRatio(targetRatio)
+                    .build()
+                capture = imageCapture
+                provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+            }
             camera = bound
             // 前置摄像头通常没有闪光灯，记录下来供按钮提示；
             // 这里不覆盖用户持久化的闪光灯设置，切回后置时仍保持原选择
             hasFlashUnit = bound.cameraInfo.hasFlashUnit()
             // 回填最大变焦倍数
             bound.cameraInfo.zoomState.value?.let { vm.setMaxZoom(it.maxZoomRatio) }
+            // 视频模式预烧一次当前水印，避免开录第一帧没有水印
+            if (state.captureMode == CaptureMode.VIDEO) {
+                watermarkDrawer.apply(buildWatermarkConfig(System.currentTimeMillis()), System.currentTimeMillis())
+            }
         } catch (e: Exception) {
             vm.setToast("相机绑定失败：" + (e.message ?: "未知错误"))
         }
@@ -328,6 +490,15 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
     LaunchedEffect(state.zoomRatio, camera) {
         val cam = camera ?: return@LaunchedEffect
         runCatching { cam.cameraControl.setZoomRatio(state.zoomRatio) }
+    }
+
+    // 录制期间水印走时：每 30 秒刷新一次烧录位图（时间只显示到分钟）
+    LaunchedEffect(state.recording) {
+        if (!state.recording) return@LaunchedEffect
+        while (true) {
+            kotlinx.coroutines.delay(30_000)
+            watermarkDrawer.apply(buildWatermarkConfig(System.currentTimeMillis()), System.currentTimeMillis())
+        }
     }
 
     DisposableEffect(Unit) {
@@ -414,29 +585,31 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         .padding(end = 10.dp)
                 )
 
-                // 右下角：上面是边拍边拼开关，下面是拼图设置入口
-                Column(
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(end = 12.dp, bottom = 12.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    StitchToggleButton(
-                        stitching = state.stitching,
-                        pendingCount = state.pendingCount,
-                        busy = state.busy,
-                        onToggle = { vm.toggleStitching() }
-                    )
-                    StitchCornerButton(
-                        stitching = state.stitching,
-                        columns = state.stitchColumns,
-                        busy = state.busy,
-                        onSettings = {
-                            showPanel = false
-                            vm.setShowStitchPanel(true)
-                        }
-                    )
+                // 右下角：上面是边拍边拼开关，下面是拼图设置入口（视频模式不显示）
+                if (state.captureMode == CaptureMode.PHOTO) {
+                    Column(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(end = 12.dp, bottom = 12.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        StitchToggleButton(
+                            stitching = state.stitching,
+                            pendingCount = state.pendingCount,
+                            busy = state.busy,
+                            onToggle = { vm.toggleStitching() }
+                        )
+                        StitchCornerButton(
+                            stitching = state.stitching,
+                            columns = state.stitchColumns,
+                            busy = state.busy,
+                            onSettings = {
+                                showPanel = false
+                                vm.setShowStitchPanel(true)
+                            }
+                        )
+                    }
                 }
             }
 
@@ -508,7 +681,11 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                                         )
                                     },
                                     onClick = {
-                                        vm.setFlashMode(mode)
+                                        if (state.captureMode == CaptureMode.VIDEO && mode == FlashMode.ON) {
+                                            vm.setToast("视频模式仅支持常亮")
+                                        } else {
+                                            vm.setFlashMode(mode)
+                                        }
                                         flashMenuOpen = false
                                     }
                                 )
@@ -583,7 +760,11 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         onClose = { showPanel = false }
                     )
                 }
-                AnimatedVisibility(visible = state.showStitchPanel, enter = fadeIn(), exit = fadeOut()) {
+                AnimatedVisibility(
+                    visible = state.showStitchPanel && state.captureMode == CaptureMode.PHOTO,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
                     StitchPanel(
                         state = state,
                         onToggleStitching = vm::toggleStitching,
@@ -613,54 +794,82 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         }
                     )
                 }
+                // 录制计时：00:12 ●
+                if (state.recording) {
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(Color(0x66000000))
+                            .padding(horizontal = 10.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFE53935))
+                        )
+                        Text(
+                            RecordTimeLabel(state.recordSeconds),
+                            color = Color.White,
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
                 // 与快门行拉开距离
                 Spacer(Modifier.height(28.dp))
                 Box(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    // 左侧：照片预览位——拍照时显示缓存成片，边拍边拼时显示最近暂存图（带张数角标）
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.CenterStart)
-                            .size(56.dp)
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(Color(0x66000000))
-                            .clickable { openImagePreview() },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        val thumb = if (state.stitching && state.pendingCount > 0) pendingThumb else (pendingThumb ?: lastGalleryBitmap)
-                        if (thumb != null) {
-                            Image(
-                                bitmap = thumb.asImageBitmap(),
-                                contentDescription = "照片预览",
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Crop
-                            )
-                        } else {
-                            Icon(Icons.Filled.Photo, "相册", tint = Color.White, modifier = Modifier.size(26.dp))
-                        }
-                        if (state.stitching && state.pendingCount > 0) {
-                            Box(
-                                Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(2.dp)
-                                    .clip(RoundedCornerShape(6.dp))
-                                    .background(ACCENT)
-                                    .padding(horizontal = 5.dp, vertical = 1.dp)
-                            ) {
-                                Text(
-                                    state.pendingCount.toString() + "张",
-                                    color = Color(0xFF0B1B2B),
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Bold
+                    // 左侧：照片预览位——拍照时显示缓存成片，边拍边拼时显示最近暂存图（带张数角标）；视频模式隐藏
+                    if (state.captureMode == CaptureMode.PHOTO) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .size(56.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0x66000000))
+                                .clickable { openImagePreview() },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            val thumb = if (state.stitching && state.pendingCount > 0) pendingThumb else (pendingThumb ?: lastGalleryBitmap)
+                            if (thumb != null) {
+                                Image(
+                                    bitmap = thumb.asImageBitmap(),
+                                    contentDescription = "照片预览",
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop
                                 )
+                            } else {
+                                Icon(Icons.Filled.Photo, "相册", tint = Color.White, modifier = Modifier.size(26.dp))
+                            }
+                            if (state.stitching && state.pendingCount > 0) {
+                                Box(
+                                    Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(2.dp)
+                                        .clip(RoundedCornerShape(6.dp))
+                                        .background(ACCENT)
+                                        .padding(horizontal = 5.dp, vertical = 1.dp)
+                                ) {
+                                    Text(
+                                        state.pendingCount.toString() + "张",
+                                        color = Color(0xFF0B1B2B),
+                                        fontSize = 9.sp,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
                             }
                         }
                     }
 
-                    // 快门固定在正中；边拍边拼时为蓝色
-                    ShutterButton(enabled = !state.shooting, active = state.stitching) {
+                    // 快门：照片模式拍照，视频模式开始/停止录制；边拍边拼时为蓝色
+                    if (state.captureMode == CaptureMode.PHOTO) {
+                        ShutterButton(enabled = !state.shooting, active = state.stitching) {
                         val imageCapture = capture ?: return@ShutterButton
                         // 拍照前再下发一次闪光灯，避免重绑相机后状态丢失
                         imageCapture.flashMode = if (state.flashMode == FlashMode.ON && hasFlashUnit) {
@@ -688,12 +897,20 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                             }
                         )
                     }
+                    } else {
+                        // 视频模式快门：圆点开始、方块停止
+                        RecordButton(recording = state.recording) { startVideoRecording() }
+                    }
 
-                    // 切换摄像头固定在右侧
+                    // 切换摄像头固定在右侧（录制中不可切换）
                     RoundIconButton(
                         onClick = {
-                            lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
-                                CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+                            if (!state.recording) {
+                                lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
+                                    CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
+                            } else {
+                                vm.setToast("请先停止录制")
+                            }
                         },
                         size = 52.dp,
                         modifier = Modifier.align(Alignment.CenterEnd)
@@ -716,7 +933,14 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                                 color = if (selected) Color.White else Color(0x99FFFFFF),
                                 fontSize = 14.sp,
                                 fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
-                                modifier = Modifier.clickable { vm.setCaptureMode(mode) }
+                                modifier = Modifier.clickable {
+                                    if (!state.recording) {
+                                        vm.setCaptureMode(mode)
+                                        if (mode == CaptureMode.VIDEO && !hasAudio) {
+                                            audioPermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO))
+                                        }
+                                    }
+                                }
                             )
                             if (selected) {
                                 Spacer(Modifier.height(4.dp))
@@ -1715,6 +1939,34 @@ private fun StitchBanner(
         }
     }
 }
+
+/** 视频模式快门：红色圆点开始录制，录制中变红色方块（点按停止） */
+@Composable
+private fun RecordButton(recording: Boolean, onClick: () -> Unit) {
+    Box(
+        Modifier
+            .size(76.dp)
+            .clip(CircleShape)
+            .background(Brush.radialGradient(listOf(Color.White, Color(0xFFE0E0E0))))
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        if (recording) {
+            Box(
+                Modifier
+                    .size(26.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color(0xFFE53935))
+            )
+        } else {
+            Box(Modifier.size(58.dp).clip(CircleShape).background(Color(0xFFE53935)))
+        }
+    }
+}
+
+/** 录制计时 mm:ss */
+private fun RecordTimeLabel(seconds: Int): String =
+    "%02d:%02d".format(seconds / 60, seconds % 60)
 
 /** 边拍边拼未开拍时的中间引导 */
 @Composable

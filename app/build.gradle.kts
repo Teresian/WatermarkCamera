@@ -14,8 +14,8 @@ android {
         targetSdk = 34
         // 版本规则：默认只递增最后一位（0.0.x）；主次版本号需人工确认才动。
         // RC 标签按顺序往后加：RC1、RC2、RC3……
-        versionCode = 7
-        versionName = "0.0.2"
+        versionCode = 8
+        versionName = "0.0.3-RC1"
         vectorDrawables { useSupportLibrary = true }
     }
 
@@ -87,11 +87,14 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    val camerax = "1.3.4"
+    val camerax = "1.4.2"
     implementation("androidx.camera:camera-core:$camerax")
     implementation("androidx.camera:camera-camera2:$camerax")
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
+    implementation("androidx.camera:camera-video:$camerax")
+    // 视频水印实时烧录：OverlayEffect
+    implementation("androidx.camera:camera-effects:$camerax")
 
     implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("androidx.datastore:datastore-preferences:1.1.1")
