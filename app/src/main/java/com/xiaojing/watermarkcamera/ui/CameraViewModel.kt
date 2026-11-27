@@ -22,6 +22,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 
 /** 拍摄画幅 */
@@ -44,6 +45,18 @@ enum class FlashMode(val label: String) {
     TORCH("常亮")
 }
 
+/** 底部拍摄模式：照片 / 视频（默认照片） */
+enum class CaptureMode(val label: String) {
+    PHOTO("照片"),
+    VIDEO("视频")
+}
+
+/** 地点水印显示方式：地址优先（拿不到地址回退坐标）/ 只显示坐标 */
+enum class LocationDisplayMode(val label: String) {
+    ADDRESS("地址"),
+    COORDINATE("坐标")
+}
+
 /** 备注默认快捷选项（可自行增删） */
 val DEFAULT_NOTE_PRESETS = listOf("总表", "电采暖A项", "电采暖B项", "电采暖C项")
 
@@ -52,11 +65,12 @@ data class WatermarkUiState(
     val showDate: Boolean = true,
     val showWeather: Boolean = true,
     val showLocation: Boolean = true,
-    val showNote: Boolean = false,
-    val note: String = "",
+    val showNote: Boolean = true,
+    val note: String = "总表",
     val location: String = "",
     val weather: String = "",
-    val placeLevel: PlaceLevel = PlaceLevel.STREET,
+    val placeLevel: PlaceLevel = PlaceLevel.POI,
+    val locationMode: LocationDisplayMode = LocationDisplayMode.ADDRESS,
     val locationLoading: Boolean = false,
     val shooting: Boolean = false,
     val toast: String? = null,
@@ -76,7 +90,9 @@ data class WatermarkUiState(
     val zoomRatio: Float = 1f,
     val maxZoom: Float = 8f,
     // 拼图设置面板
-    val showStitchPanel: Boolean = false
+    val showStitchPanel: Boolean = false,
+    // 拍摄模式：照片 / 视频
+    val captureMode: CaptureMode = CaptureMode.PHOTO
 )
 
 class CameraViewModel(app: Application) : AndroidViewModel(app) {
@@ -90,13 +106,33 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 .getOrDefault(FlashMode.OFF),
             grid = runCatching { GridMode.valueOf(prefs.getString(KEY_GRID, GridMode.NONE.name)!!) }
                 .getOrDefault(GridMode.NONE),
-            stitchColumns = prefs.getInt(KEY_COLUMNS, 2).coerceIn(1, 4)
+            stitchColumns = prefs.getInt(KEY_COLUMNS, 2).coerceIn(1, 4),
+            placeLevel = runCatching { PlaceLevel.valueOf(prefs.getString(KEY_PLACE_LEVEL, PlaceLevel.POI.name)!!) }
+                .getOrDefault(PlaceLevel.POI),
+            locationMode = runCatching {
+                LocationDisplayMode.valueOf(prefs.getString(KEY_LOCATION_MODE, LocationDisplayMode.ADDRESS.name)!!)
+            }.getOrDefault(LocationDisplayMode.ADDRESS)
         )
     )
     val state: StateFlow<WatermarkUiState> = _state.asStateFlow()
 
-    /** 边拍边拼暂存区：已烧好水印、等待拼接的图片 */
-    private val pending = ArrayList<Bitmap>()
+    /** 最近一张暂存图的缩略图（拍照时在左下预览位显示） */
+    private val _pendingThumb = MutableStateFlow<Bitmap?>(null)
+    val pendingThumb: StateFlow<Bitmap?> = _pendingThumb.asStateFlow()
+
+    /** 读取暂存区第 index 张（0 为最先拍的），供内置预览器显示大图 */
+    fun pendingBitmapAt(index: Int): Bitmap? = synchronized(pendingLock) {
+        pending.getOrNull(index)?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+    }
+
+    /** 缓存最近一次定位结果，切换地址/坐标显示时无需重新定位 */
+    private var lastPlace: com.xiaojing.watermarkcamera.util.PlaceResult? = null
+
+    /** 边拍边拼暂存区：已烧好水印并压缩为 JPEG 字节，避免多张大图常驻内存 */
+    private val pending = mutableListOf<ByteArray>()
+
+    /** 保护暂存区的并发访问：拍照写入在 IO 协程，撤销/清空/拼接在 UI 侧 */
+    private val pendingLock = Any()
 
     fun toggleTime() = _state.update { it.copy(showTime = !it.showTime) }
 
@@ -185,9 +221,38 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setShowStitchPanel(show: Boolean) = _state.update { it.copy(showStitchPanel = show) }
 
+    fun setCaptureMode(mode: CaptureMode) {
+        if (mode == CaptureMode.VIDEO) {
+            setToast("视频拍摄暂未开放，请先使用照片模式")
+            return
+        }
+        _state.update { it.copy(captureMode = CaptureMode.PHOTO) }
+    }
+
     fun setPlaceLevel(level: PlaceLevel) {
+        prefs.edit().putString(KEY_PLACE_LEVEL, level.name).apply()
         _state.update { it.copy(placeLevel = level) }
         refreshLocation()
+    }
+
+    /** 切换地址/坐标显示：持久化，并用缓存结果即时刷新，无需重新定位 */
+    fun setLocationMode(mode: LocationDisplayMode) {
+        prefs.edit().putString(KEY_LOCATION_MODE, mode.name).apply()
+        _state.update {
+            it.copy(
+                locationMode = mode,
+                location = formatLocation(lastPlace, mode)
+            )
+        }
+    }
+
+    /** 地址优先：地址可用就显示地址，否则回退坐标；坐标模式只显示坐标 */
+    private fun formatLocation(place: com.xiaojing.watermarkcamera.util.PlaceResult?, mode: LocationDisplayMode): String {
+        if (place == null) return ""
+        return when (mode) {
+            LocationDisplayMode.ADDRESS -> place.address?.takeIf { it.isNotBlank() } ?: place.coord
+            LocationDisplayMode.COORDINATE -> place.coord
+        }
     }
 
     fun toggleStitching() = _state.update { it.copy(stitching = !it.stitching) }
@@ -205,10 +270,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val level = _state.value.placeLevel
         viewModelScope.launch {
             val place = LocationHelper.currentPlace(getApplication(), level)
+            lastPlace = place
             val weather = place?.let { WeatherHelper.current(it.lat, it.lon) }.orEmpty()
             _state.update {
                 it.copy(
-                    location = place?.name.orEmpty(),
+                    location = formatLocation(place, it.locationMode),
                     weather = weather,
                     locationLoading = false,
                     toast = if (place == null) "定位失败，请检查定位权限与开关" else it.toast
@@ -217,15 +283,17 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun onPhotoCaptured(file: File) {
+    fun onPhotoCaptured(file: File, capturedAt: Long = System.currentTimeMillis()) {
         if (_state.value.shooting) return
         _state.update { it.copy(shooting = true) }
         val snapshot = _state.value
         viewModelScope.launch {
-            val result = withContext(Dispatchers.IO) {
+            // null 表示失败；true 表示成功落相册或成功暂存
+            val success = withContext(Dispatchers.IO) {
                 var bitmap: Bitmap? = null
+                var stamped: Bitmap? = null
                 try {
-                    bitmap = decode(file)
+                    bitmap = decode(file) ?: return@withContext null
                     val config = WatermarkConfig(
                         showTime = snapshot.showTime,
                         showDate = snapshot.showDate,
@@ -235,32 +303,45 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                         note = snapshot.note,
                         location = snapshot.location,
                         weather = snapshot.weather,
-                        timestamp = System.currentTimeMillis()
+                        timestamp = capturedAt
                     )
-                    val stamped = WatermarkRenderer.render(bitmap, config)
-                    if (stamped !== bitmap) bitmap.recycle()
+                    val output = WatermarkRenderer.render(bitmap!!, config)
+                    stamped = output
+                    if (output !== bitmap) bitmap!!.recycle()
+                    bitmap = null
+
                     if (snapshot.stitching) {
-                        // 边拍边拼：先进暂存区，不落相册
-                        pending.add(stamped)
-                        null
+                        // 暂存压缩后的 JPEG，避免多张 ARGB_8888 大图同时常驻导致 OOM
+                        val bytes = ByteArrayOutputStream().use { bos ->
+                            if (!output.compress(Bitmap.CompressFormat.JPEG, 90, bos)) null
+                            else bos.toByteArray()
+                        } ?: return@withContext null
+                        // 生成小缩略图供左下预览位显示（不持有大图）
+                        val thumb = Bitmap.createScaledBitmap(output, 160, 160, true)
+                        synchronized(pendingLock) { pending.add(bytes) }
+                        _pendingThumb.value = thumb
+                        true
                     } else {
-                        val saved = ImageSaver.save(getApplication(), stamped)
-                        if (saved == null) stamped.recycle()
-                        saved
+                        // 普通拍照：左下预览位显示本次成片缩略图
+                        _pendingThumb.value = Bitmap.createScaledBitmap(output, 160, 160, true)
+                        ImageSaver.save(getApplication(), output) != null
                     }
                 } catch (e: Exception) {
                     null
                 } finally {
+                    stamped?.recycle()
+                    bitmap?.recycle()
                     file.delete()
                 }
             }
+            val count = synchronized(pendingLock) { pending.size }
             _state.update {
                 it.copy(
                     shooting = false,
-                    pendingCount = pending.size,
+                    pendingCount = count,
                     toast = when {
-                        it.stitching -> "已暂存第 " + pending.size + " 张"
-                        result == null -> "保存失败，请检查存储权限"
+                        success == null -> if (snapshot.stitching) "暂存失败，请重试" else "保存失败，请检查存储权限"
+                        snapshot.stitching -> "已暂存第 $count 张"
                         else -> "已保存到相册/WatermarkCamera"
                     }
                 )
@@ -270,79 +351,109 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     /** 把暂存区里的照片按列数拼成一张并保存 */
     fun stitchAndSave() {
-        if (pending.isEmpty()) {
+        val snapshots = synchronized(pendingLock) { pending.toList() }
+        if (snapshots.isEmpty()) {
             _state.update { it.copy(toast = "暂存区是空的，先拍几张") }
             return
         }
         if (_state.value.busy) return
         val columns = _state.value.stitchColumns
-        val sources = ArrayList(pending)
         _state.update { it.copy(busy = true) }
         viewModelScope.launch {
-            val path = withContext(Dispatchers.IO) {
+            val success = withContext(Dispatchers.IO) {
+                var sources: List<Bitmap> = emptyList()
                 var merged: Bitmap? = null
                 try {
+                    sources = snapshots.mapNotNull { bytes ->
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                    }
+                    if (sources.size != snapshots.size) return@withContext false
                     merged = PhotoStitcher.stitch(sources, columns)
-                    val saved = merged?.let { ImageSaver.save(getApplication(), it) }
-                    saved
+                    merged?.let { ImageSaver.save(getApplication(), it) != null } ?: false
                 } catch (e: Exception) {
-                    null
+                    false
                 } finally {
                     merged?.recycle()
+                    sources.forEach { if (!it.isRecycled) it.recycle() }
                 }
             }
-            if (path != null) {
-                sources.forEach { it.recycle() }
-                pending.clear()
+            if (success) {
+                // 只移除本次参与拼接的批次，不误删处理期间新拍的照片
+                synchronized(pendingLock) { pending.removeAll(snapshots.toSet()) }
+                refreshPendingThumb()
             }
+            val count = synchronized(pendingLock) { pending.size }
             _state.update {
                 it.copy(
                     busy = false,
-                    pendingCount = pending.size,
-                    toast = if (path == null) "拼接失败，请重试"
+                    pendingCount = count,
+                    toast = if (!success) "拼接失败，请重试"
                     else "已拼成 " + PhotoStitcher.columnLabel(columns) + "长图并保存"
                 )
             }
         }
     }
 
+    /** 按暂存区最后一张刷新缩略图（在 IO 解码，避免主线程卡顿） */
+    private fun refreshPendingThumb() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val bytes = synchronized(pendingLock) { pending.lastOrNull() }
+            val thumb = bytes?.let {
+                BitmapFactory.decodeByteArray(it, 0, it.size)?.let { bmp ->
+                    Bitmap.createScaledBitmap(bmp, 160, 160, true)
+                }
+            }
+            _pendingThumb.value = thumb
+        }
+    }
+
     /** 清空暂存区 */
     fun clearPending() {
-        pending.forEach { if (!it.isRecycled) it.recycle() }
-        pending.clear()
+        synchronized(pendingLock) { pending.clear() }
+        _pendingThumb.value = null
         _state.update { it.copy(pendingCount = 0, toast = "已清空暂存区") }
     }
 
     /** 撤销最后一张暂存 */
     fun undoPending() {
-        if (pending.isEmpty()) return
-        val last = pending.removeAt(pending.size - 1)
-        if (!last.isRecycled) last.recycle()
-        _state.update { it.copy(pendingCount = pending.size, toast = "已撤销最后一张") }
+        val removed = synchronized(pendingLock) {
+            if (pending.isEmpty()) false
+            else {
+                pending.removeAt(pending.size - 1)
+                true
+            }
+        }
+        if (!removed) return
+        refreshPendingThumb()
+        val count = synchronized(pendingLock) { pending.size }
+        _state.update { it.copy(pendingCount = count, toast = "已撤销最后一张") }
     }
 
     override fun onCleared() {
         super.onCleared()
-        pending.forEach { if (!it.isRecycled) it.recycle() }
-        pending.clear()
+        synchronized(pendingLock) { pending.clear() }
+        _pendingThumb.value = null
     }
 
     private companion object {
         const val KEY_FLASH = "flash_mode"
         const val KEY_GRID = "grid_mode"
         const val KEY_COLUMNS = "stitch_columns"
+        const val KEY_PLACE_LEVEL = "place_level"
+        const val KEY_LOCATION_MODE = "location_mode"
     }
 
-    private fun decode(file: File): Bitmap {
+    private fun decode(file: File): Bitmap? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
 
         val maxSide = 3000
         var sample = 1
         while (bounds.outWidth / sample > maxSide || bounds.outHeight / sample > maxSide) sample *= 2
 
         val opts = BitmapFactory.Options().apply { inSampleSize = sample }
-        val bitmap = BitmapFactory.decodeFile(file.absolutePath, opts)
+        val bitmap = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return null
 
         val rotation = try {
             when (ExifInterface(file.absolutePath).getAttributeInt(

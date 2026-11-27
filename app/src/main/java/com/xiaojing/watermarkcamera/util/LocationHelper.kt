@@ -18,14 +18,17 @@ enum class PlaceLevel(val label: String) {
     POI("地点")
 }
 
-/** 定位结果：可读地名 + 坐标（坐标供天气查询使用） */
-data class PlaceResult(val name: String, val lat: Double, val lon: Double)
+/** 定位结果：反解出的地址（可为空）+ 坐标（坐标供天气查询与「坐标模式」使用） */
+data class PlaceResult(val address: String?, val lat: Double, val lon: Double) {
+    /** 格式化坐标，用于「坐标模式」或地址反解失败时的回退显示 */
+    val coord: String get() = String.format(Locale.US, "%.4f, %.4f", lat, lon)
+}
 
 /** 通过系统定位拿到一个粗略坐标，再反解成可读地名 */
 object LocationHelper {
 
     @SuppressLint("MissingPermission")
-    suspend fun currentPlace(context: Context, level: PlaceLevel = PlaceLevel.STREET): PlaceResult? =
+    suspend fun currentPlace(context: Context, level: PlaceLevel = PlaceLevel.POI): PlaceResult? =
         withContext(Dispatchers.IO) {
             val location = try {
                 lastKnown(context)
@@ -33,13 +36,13 @@ object LocationHelper {
                 null
             } ?: return@withContext null
 
-            val name = try {
+            val address = try {
                 geocode(context, location, level)
             } catch (e: Exception) {
                 null
             }
             PlaceResult(
-                name = name ?: formatCoord(location),
+                address = address,
                 lat = location.latitude,
                 lon = location.longitude
             )
@@ -95,8 +98,4 @@ object LocationHelper {
             else -> base
         }
     }
-
-    private fun formatCoord(location: Location): String = String.format(
-        Locale.US, "%.4f, %.4f", location.latitude, location.longitude
-    )
 }
