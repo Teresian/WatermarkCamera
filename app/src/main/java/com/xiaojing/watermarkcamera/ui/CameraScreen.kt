@@ -1,7 +1,14 @@
 package com.xiaojing.watermarkcamera.ui
 
 import android.Manifest
+import android.content.ContentUris
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Build
+import android.provider.MediaStore
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.AspectRatio
@@ -17,6 +24,7 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -34,6 +42,7 @@ import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.MyLocation
+import androidx.compose.material.icons.filled.Photo
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material3.*
@@ -44,7 +53,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -89,7 +100,58 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
     var capture by remember { mutableStateOf<ImageCapture?>(null) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
     var flashMenuOpen by remember { mutableStateOf(false) }
+    var lastGalleryBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var lastGalleryUri by remember { mutableStateOf<Uri?>(null) }
     val cameraExecutor = remember { Executors.newSingleThreadExecutor() }
+
+    // 相册预览：读取本应用最近保存的一张水印照片，点击直接查看大图
+    fun refreshGalleryThumb() {
+        val resolver = context.contentResolver
+        val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        val projection = arrayOf(MediaStore.Images.Media._ID)
+        val sel = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            "${MediaStore.Images.Media.RELATIVE_PATH} LIKE ?"
+        } else {
+            "${MediaStore.Images.Media.DATA} LIKE ?"
+        }
+        val args = arrayOf("%WatermarkCamera%")
+        val cursor = resolver.query(uri, projection, sel, args, "${MediaStore.Images.Media._ID} DESC")
+        val id = cursor?.use { c ->
+            if (c.moveToFirst()) c.getLong(c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)) else null
+        }
+        if (id == null) {
+            lastGalleryBitmap = null
+            lastGalleryUri = null
+            return
+        }
+        val u = ContentUris.withAppendedId(uri, id)
+        lastGalleryUri = u
+        lastGalleryBitmap = runCatching {
+            resolver.openInputStream(u)?.use { input ->
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeStream(input, null, bounds)
+                val sample = maxOf(1, bounds.outWidth / 240, bounds.outHeight / 240)
+                val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+                resolver.openInputStream(u)?.use { BitmapFactory.decodeStream(it, null, opts) }
+            }
+        }.getOrNull()
+    }
+
+    LaunchedEffect(Unit) { refreshGalleryThumb() }
+
+    fun openGalleryPreview() {
+        val u = lastGalleryUri
+        if (u != null) {
+            runCatching {
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW, u).setType("image/*")
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                )
+            }
+        } else {
+            vm.setToast("相册里还没有水印照片")
+        }
+    }
 
     // 取景框顶边：贴在上方按键下面，再留 5 像素
     val viewfinderTop = TOP_BAR_TOP + TOP_BUTTON + with(density) { 5.toDp() }
@@ -248,21 +310,32 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         .padding(end = 10.dp)
                 )
 
-                // 右下角：没拍照时是拼图设置，有暂存后是拼图确定
-                StitchCornerButton(
-                    pendingCount = state.pendingCount,
-                    stitching = state.stitching,
-                    columns = state.stitchColumns,
-                    busy = state.busy,
-                    onSettings = {
-                        showPanel = false
-                        vm.setShowStitchPanel(true)
-                    },
-                    onConfirm = { vm.stitchAndSave() },
+                // 右下角：上面是边拍边拼开关，下面是拼图键（没拍照=设置，有暂存=确定）
+                Column(
                     modifier = Modifier
                         .align(Alignment.BottomEnd)
-                        .padding(end = 12.dp, bottom = 12.dp)
-                )
+                        .padding(end = 12.dp, bottom = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    StitchToggleButton(
+                        stitching = state.stitching,
+                        pendingCount = state.pendingCount,
+                        busy = state.busy,
+                        onToggle = { vm.toggleStitching() }
+                    )
+                    StitchCornerButton(
+                        pendingCount = state.pendingCount,
+                        stitching = state.stitching,
+                        columns = state.stitchColumns,
+                        busy = state.busy,
+                        onSettings = {
+                            showPanel = false
+                            vm.setShowStitchPanel(true)
+                        },
+                        onConfirm = { vm.stitchAndSave(); refreshGalleryThumb() }
+                    )
+                }
             }
 
             // 面板打开时点空白关闭（只盖住取景框，顶部按键仍可用）
@@ -421,35 +494,34 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                     )
                 }
                 Spacer(Modifier.height(16.dp))
-                Row(
+                Box(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 32.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
+                    contentAlignment = Alignment.Center
                 ) {
-                    // 边拍边拼开关
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
+                    // 左侧：相册预览，显示最近保存的一张水印照片，点击进入系统相册
+                    Box(
                         modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(if (state.stitching) ACCENT else Color(0x66000000))
-                            .clickable { vm.toggleStitching() }
-                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                            .align(Alignment.CenterStart)
+                            .size(56.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0x66000000))
+                            .clickable { openGalleryPreview() },
+                        contentAlignment = Alignment.Center
                     ) {
-                        Text(
-                            if (state.stitching) "拼图中" else "边拍边拼",
-                            color = if (state.stitching) Color(0xFF0B1B2B) else Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                        if (state.pendingCount > 0) {
-                            Text(
-                                state.pendingCount.toString() + " 张",
-                                color = if (state.stitching) Color(0xFF0B1B2B) else ACCENT,
-                                fontSize = 10.sp
+                        val thumb = lastGalleryBitmap
+                        if (thumb != null) {
+                            Image(
+                                bitmap = thumb.asImageBitmap(),
+                                contentDescription = "相册预览",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
                             )
+                        } else {
+                            Icon(Icons.Filled.Photo, "相册", tint = Color.White, modifier = Modifier.size(26.dp))
                         }
                     }
 
+                    // 快门固定在正中
                     ShutterButton(enabled = !state.shooting) {
                         val imageCapture = capture ?: return@ShutterButton
                         // 拍照前再下发一次闪光灯，避免重绑相机后状态丢失
@@ -466,6 +538,7 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                             object : ImageCapture.OnImageSavedCallback {
                                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                                     vm.onPhotoCaptured(file)
+                                    if (!state.stitching) refreshGalleryThumb()
                                 }
 
                                 override fun onError(exception: ImageCaptureException) {
@@ -476,13 +549,14 @@ fun CameraScreen(vm: CameraViewModel = viewModel()) {
                         )
                     }
 
-                    // 切换摄像头
+                    // 切换摄像头固定在右侧
                     RoundIconButton(
                         onClick = {
                             lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK)
                                 CameraSelector.LENS_FACING_FRONT else CameraSelector.LENS_FACING_BACK
                         },
-                        size = 52.dp
+                        size = 52.dp,
+                        modifier = Modifier.align(Alignment.CenterEnd)
                     ) {
                         Icon(Icons.Filled.SwapHoriz, "切换摄像头", tint = Color.White, modifier = Modifier.size(24.dp))
                     }
@@ -549,6 +623,39 @@ private fun ZoomGestureLayer(onZoom: (Float) -> Unit, modifier: Modifier = Modif
             }
         }
     )
+}
+
+/** 拼图键上方的边拍边拼开关：点击切换状态，显示暂存张数 */
+@Composable
+private fun StitchToggleButton(
+    stitching: Boolean,
+    pendingCount: Int,
+    busy: Boolean,
+    onToggle: () -> Unit
+) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .width(58.dp)
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (stitching) ACCENT else Color(0x66000000))
+            .clickable(enabled = !busy, onClick = onToggle)
+            .padding(vertical = 6.dp)
+    ) {
+        Text(
+            if (stitching) "拼图中" else "边拍边拼",
+            color = if (stitching) Color(0xFF0B1B2B) else Color.White,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold
+        )
+        if (pendingCount > 0) {
+            Text(
+                pendingCount.toString() + " 张",
+                color = if (stitching) Color(0xFF0B1B2B) else ACCENT,
+                fontSize = 10.sp
+            )
+        }
+    }
 }
 
 /** 取景框右下角：没拍照=拼图设置，有暂存=拼图确定（长按始终打开设置） */
@@ -1016,10 +1123,11 @@ private fun ToggleRow(label: String, checked: Boolean, onChange: () -> Unit) {
 private fun RoundIconButton(
     onClick: () -> Unit,
     size: androidx.compose.ui.unit.Dp = 44.dp,
+    modifier: Modifier = Modifier,
     content: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit
 ) {
     Box(
-        modifier = Modifier
+        modifier = modifier
             .size(size)
             .clip(CircleShape)
             .background(Color(0x66000000))
